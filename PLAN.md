@@ -252,6 +252,14 @@ it (or a user can run it in a terminal during development). What we ship in
 4. **Future (post-MVP)** — karibad runs freshclam itself on schedule (it is
    already root): one unified "Update definitions" flow regardless of init
    system. MVP relies on the OS mechanism and only monitors it.
+5. **YARA rules feed (Phase 2)** — yara-x ships no rules; signatures live in
+   community feeds (Yara-Rules, Neo23x0/signature-base, vendor-published
+   rules) with **mixed licenses** (parts CC-BY-NC or detection-use-only), so
+   nothing can be bundled blindly. Kariba must play the role freshclam plays
+   for ClamAV: feed manifest (URL/version/license), periodic fetch,
+   compile-on-load, tiering (core packer rules always on, family rules
+   optional), and resilience — a broken third-party rule must be skipped with
+   a warning, never abort a scan.
 
 ## Features
 
@@ -262,6 +270,13 @@ it (or a user can run it in a terminal during development). What we ship in
    - Block execution / scan on create-modify-close
    - Auto-quarantine detected threats
    - Configurable exclusions (paths, file types, processes)
+   - Catches files regardless of arrival vector (browser download, archive
+     extraction, USB copy): everything lands on disk and passes fanotify.
+     Encrypted archives are never decrypted — extracted files are scanned on
+     landing, same model as Windows Defender's minifilter
+   - Synchronous verdicts: permission events hold the syscall until karibad
+     allows/denies, so scan latency is user-visible; needs a timeout policy
+     (fail-open + background re-scan vs. deny)
 
 2. **On-Demand Scanning**
    - Quick scan (`~/Downloads`, `/tmp`, `/var/tmp`)
@@ -269,6 +284,11 @@ it (or a user can run it in a terminal during development). What we ship in
    - Custom scan (user-selected paths)
    - Archives (.zip, .tar, .gz, .7z) via ClamAV
    - Mounted drives / network shares (optional)
+   - Smart-scan phases `[post-MVP]` — instead of one raw filesystem walk, run
+     ordered stages with per-stage progress (Avast lineage): memory/process
+     locations → autostart entries → home directories → full tree → archives.
+     Needs engine-layer support for stage-aware scanning and a protocol
+     extension to report the current phase in `scan.progress`.
 
 3. **Scheduled Scans** — internal cron-like scheduler (no cron dependency),
    auto definition updates, optional scan-on-boot.
@@ -288,8 +308,8 @@ it (or a user can run it in a terminal during development). What we ship in
 8. **System Security Audit** — Lynis run, 0-100 score, hardening
    recommendations, trend over time.
 
-9. **Definition Updates** — auto/manual for ClamAV (freshclam), YARA rules,
-   LMD; update history log.
+9. **Definition Updates** — auto/manual for ClamAV (freshclam), YARA rules
+   (curated community feeds), LMD; update history log.
 
 10. **System Tray** — StatusNotifierItem icon (green/yellow/red), quick
     actions, minimal idle footprint.
@@ -523,7 +543,10 @@ Assumptions to Verify.
 ### Phase 2: Advanced Engines (2-3 months)
 
 6. **yara-x integration** — rule loading, scan alongside ClamAV,
-   engine-specific results.
+   engine-specific results. Includes the **rules-feed layer**: yara-x is
+   engine-only (no freshclam equivalent exists — see Operational Notes §5),
+   so Kariba aggregates community feeds, curates for license/quality, and
+   fetches/versions/compiles them on load.
 7. **Rootkit detection** — rkhunter scheduling + remediation guide.
 8. **File integrity monitoring** — AIDE baseline wizard, periodic checks,
    alerts with whitelist workflow.
@@ -550,6 +573,15 @@ Assumptions to Verify.
    `freshclam` for updates, careful permission handling on quarantine.
 2. **Real-time monitoring** — fanotify needs root (solved: root daemon);
    watch limits; balance coverage vs. performance; inotify fallback.
+   Permission events hold the syscall, so verdicts must be fast (bounded
+   scan latency + timeout policy); there is a small race between
+   close-write and verdict where a non-exec read can touch a file — the
+   exec gate closes the dangerous path. If karibad dies, the kernel
+   auto-allows pending events (fail-open is kernel behavior, not a choice),
+   so service supervision with restart-on-crash is the mitigation. MVP
+   watches `~/Downloads` + `/tmp`; fanotify marks are per-mount, so
+   expanding to system-wide is a scaling/config question, not an
+   architecture change.
 3. **File integrity** — large AIDE DB, handling legitimate system updates,
    false-positive whitelist workflow.
 4. **Cross-distro compatibility** — package names, service names, and socket
@@ -569,18 +601,16 @@ Assumptions to Verify.
 
 Exposed during GUI testing (2026-08-23) — fix before alpha:
 
-1. **Orphaned scans** — if the client disconnects mid-scan (CLI killed, GUI
-   closed), karibad's scan thread keeps scanning indefinitely (send errors to
-   the dead socket are ignored). Fix: track connection liveness / cancel flag;
-   abort the scan when the client goes away.
-2. **No scan cancellation** — `scan.cancel` is specced in the protocol but not
-   implemented; there is no way to stop a running scan.
-3. **DB lock held for whole scan** — the `Mutex<Db>` guard spans the entire
-   scan, so `status`/`quarantine.*` calls block until a long scan finishes.
-   Fix: short-lived lock per DB operation.
-4. **Sequential scan throughput** — ~60 files/s on `/usr` (single clamd
+1. **Sequential scan throughput** — ~60 files/s on `/usr` (single clamd
    connection, one round-trip per file). Phase 3 parallel scanning (worker
    pool + multiple clamd connections or `INSTREAM` batching) addresses this.
+
+Resolved (2026-08-23): DB lock held for whole scan (scanner now takes
+short-lived locks per DB operation; GUI commands are async, so status /
+quarantine stay responsive mid-scan). Orphaned scans + no cancellation
+(`scan.cancel` implemented with a per-scan cancel flag; failed notification
+sends on a dead client connection now also cancel the scan, so disconnected
+clients no longer leave scans running).
 
 ## Testing Strategy
 
@@ -657,7 +687,10 @@ verify these when we reach the relevant systems:
       plain `clamav` `[verified 2026-08-23]`; Debian/Ubuntu, Fedora,
       openSUSE still open)
 - [ ] CrowdSec / Lynis / rkhunter / AIDE packaging and service names per
-      distro
+  distro
+- [ ] YARA rules feeds: license terms for Yara-Rules / Neo23x0
+  signature-base / vendor-published rules, and which redistribution-clean
+  subset can be bundled vs. must be fetched at runtime
 - [ ] polkit agent availability/behavior across desktops (KDE/GNOME/Xfce)
 - [ ] Phase 1 exit criteria on Ubuntu (deb) and Fedora (rpm)
 
