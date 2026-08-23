@@ -584,11 +584,13 @@ names free; no conflicting security product; GitHub org handled by
 1. ~~Choose a name~~ → **Kariba** ✓
 2. Dev environment setup ✓ (Artix: `clamav` + `clamav-openrc`, freshclam DBs
    downloaded, clamd running, `clamdscan` sanity check passed)
-3. Scaffold cargo workspace (local git, Conventional Commits)
-4. `kariba-core` + `kariba-survey` (distro×init detection, ClamAV checks)
-5. `karibad` skeleton + JSON-RPC IPC + SQLite schema
-6. `engines/clamav` (clamd socket client) + quarantine (mode 000)
-7. `kariba-cli status|survey|scan|quarantine` + EICAR end-to-end proof
+3. Scaffold cargo workspace ✓ (local git, Conventional Commits)
+4. `kariba-core` + `kariba-survey` ✓ (distro×init detection, ClamAV checks)
+5. `karibad` skeleton + JSON-RPC IPC + SQLite schema ✓
+6. `engines/clamav` (clamd socket client) + quarantine (mode 000) ✓
+7. `kariba-cli status|survey|scan|quarantine` + EICAR end-to-end proof ✓
+   (EICAR detected ~20ms → quarantined mode 000 → restored byte-identical →
+   deleted; verified 2026-08-23 on Artix dev machine)
 8. Packaging: systemd unit `[ASSUMPTION]` + OpenRC script
 9. GUI: Tauri 2 scaffold, dashboard + scan view wired to the daemon
 10. Push to `FlowOSS/kariba`, alpha release for community feedback
