@@ -9,6 +9,8 @@ pub mod method {
     pub const STATUS: &str = "status";
     pub const SURVEY_RUN: &str = "survey.run";
     pub const SCAN_START: &str = "scan.start";
+    pub const SCAN_CANCEL: &str = "scan.cancel";
+    pub const SCAN_HISTORY: &str = "scan.history";
     pub const QUARANTINE_LIST: &str = "quarantine.list";
     pub const QUARANTINE_RESTORE: &str = "quarantine.restore";
     pub const QUARANTINE_DELETE: &str = "quarantine.delete";
@@ -170,12 +172,32 @@ pub struct ScanParams {
     pub paths: Vec<PathBuf>,
     #[serde(default)]
     pub quarantine: bool,
+    // "quick" | "full" | "custom" — recorded in scan history.
+    #[serde(default = "default_scan_kind")]
+    pub kind: String,
+}
+
+fn default_scan_kind() -> String {
+    "custom".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanHistoryItem {
+    pub id: u64,
+    pub kind: String,
+    pub paths: Vec<String>,
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
+    pub files_scanned: u64,
+    pub threats_found: u32,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanProgress {
     pub scan_id: u64,
     pub files_scanned: u64,
+    pub files_total: u64,
     pub threats_found: u32,
     pub current: String,
 }
@@ -273,10 +295,19 @@ mod tests {
         let params = ScanParams {
             paths: vec![PathBuf::from("/tmp")],
             quarantine: true,
+            kind: "quick".into(),
         };
         let value = serde_json::to_value(&params).unwrap();
         let back: ScanParams = serde_json::from_value(value).unwrap();
         assert!(back.quarantine);
         assert_eq!(back.paths.len(), 1);
+        assert_eq!(back.kind, "quick");
+    }
+
+    #[test]
+    fn scan_params_kind_defaults_to_custom() {
+        let value = serde_json::json!({ "paths": ["/tmp"], "quarantine": false });
+        let params: ScanParams = serde_json::from_value(value).unwrap();
+        assert_eq!(params.kind, "custom");
     }
 }

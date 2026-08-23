@@ -1,11 +1,13 @@
 use kariba_ipc::client::{reader, respond};
 use kariba_ipc::protocol::{
-    IdParams, QuarantineItem, RpcError, ScanParams, StatusResult, WireMessage, error_code, method,
-    parse_line,
+    IdParams, QuarantineItem, RpcError, ScanHistoryItem, ScanParams, StatusResult, WireMessage,
+    error_code, method, parse_line,
 };
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -13,10 +15,13 @@ use crate::db::Db;
 use crate::quarantine::Quarantine;
 use crate::scanner;
 
+const HISTORY_LIMIT: u64 = 20;
+
 pub struct Daemon {
     started_at: Instant,
     db: Mutex<Db>,
     quarantine: Quarantine,
+    active_scans: Mutex<HashMap<u64, Arc<AtomicBool>>>,
 }
 
 impl Daemon {
@@ -25,6 +30,7 @@ impl Daemon {
             started_at: Instant::now(),
             db: Mutex::new(db),
             quarantine,
+            active_scans: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -86,9 +92,50 @@ fn dispatch(
                     return Err(invalid_params(format!("{} does not exist", path.display())));
                 }
             }
-            let mut db = lock_db(daemon)?;
-            let result = scanner::run_scan(params, stream, &mut db, &daemon.quarantine)?;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let result = scanner::run_scan(
+                params,
+                stream,
+                &daemon.db,
+                &daemon.quarantine,
+                &daemon.active_scans,
+                cancel,
+            )?;
             serde_json::to_value(result).map_err(server_err)
+        }
+
+        method::SCAN_CANCEL => {
+            let requested: Option<IdParams> = serde_json::from_value(params).ok();
+            let active = lock_active(daemon)?;
+            let mut cancelled = 0u32;
+            for (id, flag) in active.iter() {
+                if requested.as_ref().is_some_and(|p| p.id != *id) {
+                    continue;
+                }
+                if !flag.swap(true, Ordering::Relaxed) {
+                    cancelled += 1;
+                }
+            }
+            Ok(serde_json::json!({ "cancelled": cancelled }))
+        }
+
+        method::SCAN_HISTORY => {
+            let db = lock_db(daemon)?;
+            let items: Vec<ScanHistoryItem> = db
+                .list_scans(HISTORY_LIMIT)
+                .into_iter()
+                .map(|r| ScanHistoryItem {
+                    id: r.id,
+                    kind: r.kind,
+                    paths: r.paths,
+                    started_at: r.started_at,
+                    finished_at: r.finished_at,
+                    files_scanned: r.files_scanned,
+                    threats_found: r.threats_found,
+                    status: r.status,
+                })
+                .collect();
+            serde_json::to_value(items).map_err(server_err)
         }
 
         method::QUARANTINE_LIST => {
@@ -156,6 +203,15 @@ fn lock_db(daemon: &Daemon) -> Result<std::sync::MutexGuard<'_, Db>, RpcError> {
         .db
         .lock()
         .map_err(|_| RpcError::new(error_code::SERVER_ERROR, "database lock poisoned"))
+}
+
+fn lock_active(
+    daemon: &Daemon,
+) -> Result<std::sync::MutexGuard<'_, HashMap<u64, Arc<AtomicBool>>>, RpcError> {
+    daemon
+        .active_scans
+        .lock()
+        .map_err(|_| RpcError::new(error_code::SERVER_ERROR, "active scan registry poisoned"))
 }
 
 fn server_err(e: impl std::fmt::Display) -> RpcError {

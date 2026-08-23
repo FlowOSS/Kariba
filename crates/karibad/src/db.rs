@@ -46,6 +46,17 @@ pub struct QuarantineRow {
     pub signature: String,
 }
 
+pub struct ScanRow {
+    pub id: u64,
+    pub kind: String,
+    pub paths: Vec<String>,
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
+    pub files_scanned: u64,
+    pub threats_found: u32,
+    pub status: String,
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -172,6 +183,32 @@ impl Db {
                 .unwrap_or(0) as u64
         };
         (count("scans"), count("threats"), count("quarantine"))
+    }
+
+    pub fn list_scans(&self, limit: u64) -> Vec<ScanRow> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, paths, started_at, finished_at, files_scanned,
+                        threats_found, status
+                 FROM scans ORDER BY id DESC LIMIT ?1",
+            )
+            .expect("scan history query is valid");
+        stmt.query_map(params![limit as i64], |row| {
+            let paths_json: String = row.get(2)?;
+            Ok(ScanRow {
+                id: row.get::<_, i64>(0)? as u64,
+                kind: row.get(1)?,
+                paths: serde_json::from_str(&paths_json).unwrap_or_default(),
+                started_at: row.get::<_, i64>(3)? as u64,
+                finished_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                files_scanned: row.get::<_, i64>(5)? as u64,
+                threats_found: row.get::<_, i64>(6)? as u32,
+                status: row.get(7)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
     }
 }
 

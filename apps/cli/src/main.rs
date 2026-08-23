@@ -84,11 +84,19 @@ fn main() {
             }
         },
         Command::Scan { paths, quarantine } => match with_daemon(|client| {
-            let paths = paths
+            let paths: Vec<PathBuf> = paths
                 .iter()
                 .map(|p| kariba_core::paths::expand_tilde(p))
                 .collect();
-            let params = ScanParams { paths, quarantine };
+            let kind = match paths.as_slice() {
+                [p] if p.as_os_str() == "/" => "full",
+                _ => "custom",
+            };
+            let params = ScanParams {
+                paths,
+                quarantine,
+                kind: kind.into(),
+            };
             let interactive = std::io::stdout().is_terminal();
             let value = client.call_with_notifications(
                 method::SCAN_START,
@@ -147,17 +155,20 @@ fn print_progress(notification: &Notification, interactive: bool) {
     let Ok(progress) = serde_json::from_value::<ScanProgress>(notification.params.clone()) else {
         return;
     };
+    if progress.files_total == 0 && progress.files_scanned == 0 {
+        return;
+    }
     if interactive {
         print!(
-            "\r\x1b[2K  {} files · {} threat(s) · {}",
-            progress.files_scanned, progress.threats_found, progress.current
+            "\r\x1b[2K  {}/{} files · {} threat(s) · {}",
+            progress.files_scanned, progress.files_total, progress.threats_found, progress.current
         );
         use std::io::Write;
         let _ = std::io::stdout().flush();
     } else {
         println!(
-            "  {} files · {} threat(s) · {}",
-            progress.files_scanned, progress.threats_found, progress.current
+            "  {}/{} files · {} threat(s) · {}",
+            progress.files_scanned, progress.files_total, progress.threats_found, progress.current
         );
     }
 }
