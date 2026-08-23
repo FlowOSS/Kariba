@@ -213,6 +213,28 @@ it (or a user can run it in a terminal during development). What we ship in
 - clamd socket: `/run/clamav/clamd.ctl` (per `/etc/clamav/clamd.conf`);
   config lives in `/etc/clamav/`; DBs in `/var/lib/clamav/`.
 
+**Verified facts (Arch Linux/systemd, 2026-08-23):**
+
+- A single `clamav` package ships clamd, freshclam, **and** the systemd units
+  — no separate init package needed (unlike Artix).
+- Units: `clamav-daemon.service` (socket-activated via `clamav-daemon.socket`)
+  and a separate `clamav-freshclam.service`. Confirms the systemd model:
+  freshclam is its own service, not folded into the clamd script.
+- clamd socket: `/run/clamav/clamd.ctl` (same as Artix), mode `0666`, owned
+  by the `clamav` user — non-root clients (survey, karibad) can connect.
+- First-time setup order matters: `sudo freshclam` **before** starting clamd
+  (no DBs otherwise); the initial `Clamd was NOT notified` warning is expected.
+- EICAR end-to-end re-verified on this box through karibad: detect (~37ms) →
+  quarantine (mode 000) → restore byte-identical → delete.
+- GUI gotcha on this box (Hyprland + NVIDIA RTX 5060 Ti): WebKitGTK
+  crashed at startup with `Gdk Protocol error 71` (broken NVIDIA
+  explicit-sync/DMA-BUF on Wayland), and the XWayland fallback renders a
+  solid color on NVIDIA. Fixed in-app: kariba-gui auto-sets
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` when NVIDIA + Wayland is detected
+  (`apply_nvidia_wayland_workaround`, apps/gui/src-tauri/src/main.rs).
+  User-visible workaround env vars (`WEBKIT_DISABLE_DMABUF_RENDERER=1`,
+  `__NV_DISABLE_EXPLICIT_SYNC=1`) kept only as reference.
+
 ### Operational Notes: Signature DB Updates
 
 1. **Reload coupling** — after freshclam updates the DBs it notifies clamd to
@@ -221,8 +243,9 @@ it (or a user can run it in a terminal during development). What we ship in
    age; karibad should verify clamd actually picked up new DBs after updates.
 2. **Init quirks** — how freshclam runs as a service differs per distro×init:
    Artix/OpenRC: inside the `clamd` script `[verified]`. systemd distros:
-   separate `clamav-freshclam.service` `[ASSUMPTION — verify later]`. Survey's
-   service model must encode "which service provides freshclam" per target.
+   separate `clamav-freshclam.service` `[verified on Arch 2026-08-23]`.
+   Survey's service model must encode "which service provides freshclam" per
+   target.
 3. **No-service fallback** — some systems will have no freshclam automation at
    all (manual/cron only). Survey flags a stale `daily.cvd` (mtime older than
    N days) and advises.
@@ -600,7 +623,10 @@ names free; no conflicting security product; GitHub org handled by
 
 1. ~~Choose a name~~ → **Kariba** ✓
 2. Dev environment setup ✓ (Artix: `clamav` + `clamav-openrc`, freshclam DBs
-   downloaded, clamd running, `clamdscan` sanity check passed)
+   downloaded, clamd running, `clamdscan` sanity check passed; Arch/systemd:
+   plain `clamav`, freshclam DBs, `clamav-daemon.service` +
+   `clamav-freshclam.service` enabled, EICAR round-trip re-verified
+   2026-08-23)
 3. Scaffold cargo workspace ✓ (local git, Conventional Commits)
 4. `kariba-core` + `kariba-survey` ✓ (distro×init detection, ClamAV checks)
 5. `karibad` skeleton + JSON-RPC IPC + SQLite schema ✓
@@ -615,18 +641,21 @@ names free; no conflicting security product; GitHub org handled by
 ## Assumptions to Verify
 
 Everything marked `[ASSUMPTION]` in this document, collected for later
-checking. Development happens on Artix (OpenRC); verify these when we reach
-the relevant systems:
+checking. Development happens on Artix (OpenRC) and Arch Linux (systemd);
+verify these when we reach the relevant systems:
 
-- [ ] systemd distros: ClamAV service unit names (`clamav-daemon.service`,
-      `clamav-freshclam.service` as a separate unit) — Arch-systemd, Debian,
-      Fedora
+- [x] systemd distros: ClamAV service unit names (`clamav-daemon.service`,
+      `clamav-freshclam.service` as a separate unit) — Arch-systemd
+      `[verified 2026-08-23]` (plus socket-activated `clamav-daemon.socket`);
+      Debian, Fedora still open
 - [ ] systemd: our `karibad.service` works (socket path lifecycle, restart
       behavior, hardening options)
-- [ ] clamd socket default paths per distro (`/run/clamav/clamd.ctl` is
-      Artix `[verified]`; Debian may differ, e.g. `/var/run/clamav/clamd.ctl`)
-- [ ] package names per distro family for Survey suggestions (Debian/Ubuntu,
-      Fedora, openSUSE)
+- [x] clamd socket default paths: `/run/clamav/clamd.ctl` verified on both
+      Artix `[verified]` and Arch Linux `[verified 2026-08-23]`; Debian may
+      differ, e.g. `/var/run/clamav/clamd.ctl`
+- [ ] package names per distro family for Survey suggestions (Arch/systemd:
+      plain `clamav` `[verified 2026-08-23]`; Debian/Ubuntu, Fedora,
+      openSUSE still open)
 - [ ] CrowdSec / Lynis / rkhunter / AIDE packaging and service names per
       distro
 - [ ] polkit agent availability/behavior across desktops (KDE/GNOME/Xfce)
