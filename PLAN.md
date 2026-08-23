@@ -156,6 +156,21 @@ kariba/
                           # polkit policies, deb/rpm specs
 ```
 
+### Crate Responsibilities
+
+- **kariba-core** — shared *facts and types*, zero policy: threat model,
+  config, and host-detection primitives (distro from `/etc/os-release`, init
+  system probes). These live here because several crates consume them:
+  engines need per-distro socket paths, karibad needs init awareness, survey
+  needs both.
+- **kariba-survey** — *policy* on top of core's facts: per-engine checks
+  (binary, socket, DB age, service, init script), status reports, and
+  distro×init-aware install suggestions. Detects and advises; does not
+  auto-install.
+- **kariba-ipc** — JSON-RPC protocol shared by daemon, CLI, and GUI.
+- **karibad** — orchestration: scan scheduler, quarantine, IPC server.
+- **engines/\*** — one adapter per engine; depend on core, never on survey.
+
 ### Design Decisions (vs. naive approach)
 
 1. **fanotify over inotify** for real-time protection. inotify only notifies
