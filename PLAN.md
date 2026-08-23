@@ -542,6 +542,23 @@ Assumptions to Verify.
    minimal IPC surface, fuzz the protocol, never shell out with interpolated
    user input, signed definition updates where engines support it.
 
+## Known Issues / Follow-ups
+
+Exposed during GUI testing (2026-08-23) — fix before alpha:
+
+1. **Orphaned scans** — if the client disconnects mid-scan (CLI killed, GUI
+   closed), karibad's scan thread keeps scanning indefinitely (send errors to
+   the dead socket are ignored). Fix: track connection liveness / cancel flag;
+   abort the scan when the client goes away.
+2. **No scan cancellation** — `scan.cancel` is specced in the protocol but not
+   implemented; there is no way to stop a running scan.
+3. **DB lock held for whole scan** — the `Mutex<Db>` guard spans the entire
+   scan, so `status`/`quarantine.*` calls block until a long scan finishes.
+   Fix: short-lived lock per DB operation.
+4. **Sequential scan throughput** — ~60 files/s on `/usr` (single clamd
+   connection, one round-trip per file). Phase 3 parallel scanning (worker
+   pool + multiple clamd connections or `INSTREAM` batching) addresses this.
+
 ## Testing Strategy
 
 - **EICAR** end-to-end tests through the real detection pipeline
