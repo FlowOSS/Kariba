@@ -80,7 +80,35 @@ fn scan(app: tauri::AppHandle, paths: Vec<String>, quarantine: bool) -> Result<S
     serde_json::from_value(value).map_err(|e| e.to_string())
 }
 
+/// Workaround for WebKitGTK crashing on NVIDIA + Wayland with
+/// "Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display".
+///
+/// The proprietary NVIDIA driver's explicit-sync / DMA-BUF implementation
+/// breaks WebKitGTK's GPU renderer on Wayland compositors, and the usual
+/// XWayland fallback is equally broken on NVIDIA (window renders solid
+/// color). Disabling WebKit's DMA-BUF renderer sidesteps the bug entirely.
+///
+/// Detection uses `/proc/driver/nvidia/version` instead of shelling out to
+/// `lspci` (which may not exist on minimal systems). The variable is only
+/// set when unset, so an explicit user override always wins. This keeps the
+/// fix invisible to end users — no env vars, wrapper scripts, or per-distro
+/// instructions needed. Verified on Hyprland + RTX 5060 Ti, 2026-08.
+fn apply_nvidia_wayland_workaround() {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return;
+    }
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some() {
+        return;
+    }
+    if std::path::Path::new("/proc/driver/nvidia/version").exists() {
+        // SAFETY: called at the very start of main(), before GTK/WebKit or
+        // any other thread exists, so no getenv/setenv race is possible.
+        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
+    }
+}
+
 fn main() {
+    apply_nvidia_wayland_workaround();
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             daemon_status,
