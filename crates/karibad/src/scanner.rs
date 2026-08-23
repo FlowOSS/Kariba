@@ -5,7 +5,7 @@ use kariba_ipc::protocol::{
 };
 use std::fs;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::db::Db;
@@ -13,6 +13,13 @@ use crate::quarantine::{Quarantine, sha256_file};
 
 const PROGRESS_EVERY: u64 = 100;
 const ENGINE: &str = "ClamAV";
+const EXCLUDED_PREFIXES: [&str; 4] = ["/proc", "/sys", "/dev", "/run"];
+
+fn is_excluded(path: &Path) -> bool {
+    EXCLUDED_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
 
 pub fn run_scan(
     params: ScanParams,
@@ -42,7 +49,7 @@ pub fn run_scan(
     let mut stack: Vec<PathBuf> = params.paths.clone();
 
     while let Some(entry) = stack.pop() {
-        if entry.starts_with(&skip) {
+        if entry.starts_with(&skip) || is_excluded(&entry) {
             continue;
         }
         let Ok(metadata) = entry.symlink_metadata() else {
