@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/cli",
+    "crates/karibad",
+    "crates/kariba-core",
+    "crates/kariba-ipc",
+    "crates/kariba-survey",
+    "crates/engines/clamav",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/FlowOSS/kariba"
+
+[workspace.dependencies]
+kariba-core = { path = "crates/kariba-core" }
+kariba-ipc = { path = "crates/kariba-ipc" }
+kariba-survey = { path = "crates/kariba-survey" }
+kariba-engine-clamav = { path = "crates/engines/clamav" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
