@@ -6,3 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+clap.workspace = true
+kariba-core.workspace = true
+kariba-survey.workspace = true
