@@ -33,6 +33,7 @@ export interface StatusResult {
 export interface ScanProgress {
   scan_id: number;
   files_scanned: number;
+  files_total: number;
   threats_found: number;
   current: string;
 }
@@ -49,6 +50,19 @@ export interface ScanResult {
   threats_found: number;
   quarantined: number;
   duration_ms: number;
+}
+
+export type ScanKind = "quick" | "full" | "custom";
+
+export interface ScanHistoryItem {
+  id: number;
+  kind: string;
+  paths: string[];
+  started_at: number;
+  finished_at: number | null;
+  files_scanned: number;
+  threats_found: number;
+  status: string;
 }
 
 export interface QuarantineItem {

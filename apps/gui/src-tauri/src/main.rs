@@ -2,7 +2,7 @@
 
 use kariba_core::paths;
 use kariba_ipc::protocol::{
-    IdParams, QuarantineItem, ScanParams, ScanResult, StatusResult, method,
+    IdParams, QuarantineItem, ScanHistoryItem, ScanParams, ScanResult, StatusResult, method,
 };
 use kariba_ipc::{Client, Notification};
 use serde_json::Value;
@@ -24,60 +24,109 @@ fn call(method: &str, params: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn daemon_status() -> Result<StatusResult, String> {
-    let value = call(method::STATUS, Value::Null)?;
-    serde_json::from_value(value).map_err(|e| e.to_string())
+async fn daemon_status() -> Result<StatusResult, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let value = call(method::STATUS, Value::Null)?;
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn survey() -> Result<Value, String> {
-    call(method::SURVEY_RUN, Value::Null)
+async fn survey() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| call(method::SURVEY_RUN, Value::Null))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn quarantine_list() -> Result<Vec<QuarantineItem>, String> {
-    let value = call(method::QUARANTINE_LIST, Value::Null)?;
-    serde_json::from_value(value).map_err(|e| e.to_string())
+async fn quarantine_list() -> Result<Vec<QuarantineItem>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let value = call(method::QUARANTINE_LIST, Value::Null)?;
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn quarantine_restore(id: u64) -> Result<String, String> {
-    let params = serde_json::to_value(IdParams { id }).map_err(|e| e.to_string())?;
-    let value = call(method::QUARANTINE_RESTORE, params)?;
-    Ok(value.as_str().unwrap_or("").to_string())
+async fn quarantine_restore(id: u64) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let params = serde_json::to_value(IdParams { id }).map_err(|e| e.to_string())?;
+        let value = call(method::QUARANTINE_RESTORE, params)?;
+        Ok(value.as_str().unwrap_or("").to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn quarantine_delete(id: u64) -> Result<bool, String> {
-    let params = serde_json::to_value(IdParams { id }).map_err(|e| e.to_string())?;
-    let value = call(method::QUARANTINE_DELETE, params)?;
-    Ok(value.as_bool().unwrap_or(false))
+async fn quarantine_delete(id: u64) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let params = serde_json::to_value(IdParams { id }).map_err(|e| e.to_string())?;
+        let value = call(method::QUARANTINE_DELETE, params)?;
+        Ok(value.as_bool().unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn scan(app: tauri::AppHandle, paths: Vec<String>, quarantine: bool) -> Result<ScanResult, String> {
-    let mut client = connect()?;
-    let params = ScanParams {
-        paths: paths
-            .into_iter()
-            .map(|p| kariba_core::paths::expand_tilde(std::path::Path::new(&p)))
-            .collect(),
-        quarantine,
-    };
-    let params = serde_json::to_value(params).map_err(|e| e.to_string())?;
+async fn scan(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+    quarantine: bool,
+    kind: String,
+) -> Result<ScanResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut client = connect()?;
+        let params = ScanParams {
+            paths: paths
+                .into_iter()
+                .map(|p| kariba_core::paths::expand_tilde(std::path::Path::new(&p)))
+                .collect(),
+            quarantine,
+            kind,
+        };
+        let params = serde_json::to_value(params).map_err(|e| e.to_string())?;
 
-    let value = client
-        .call_with_notifications(method::SCAN_START, params, |notification: &Notification| {
-            let event = match notification.method.as_str() {
-                method::SCAN_PROGRESS => "kariba://scan-progress",
-                method::SCAN_DETECTION => "kariba://scan-detection",
-                _ => return,
-            };
-            let _ = app.emit(event, &notification.params);
-        })
-        .map_err(|e| e.to_string())?;
+        let value = client
+            .call_with_notifications(method::SCAN_START, params, |notification: &Notification| {
+                let event = match notification.method.as_str() {
+                    method::SCAN_PROGRESS => "kariba://scan-progress",
+                    method::SCAN_DETECTION => "kariba://scan-detection",
+                    _ => return,
+                };
+                let _ = app.emit(event, &notification.params);
+            })
+            .map_err(|e| e.to_string())?;
 
-    serde_json::from_value(value).map_err(|e| e.to_string())
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn scan_cancel(scan_id: u64) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let params = serde_json::to_value(IdParams { id: scan_id }).map_err(|e| e.to_string())?;
+        let value = call(method::SCAN_CANCEL, params)?;
+        Ok(value.get("cancelled").and_then(Value::as_u64).unwrap_or(0) as u32)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn scan_history() -> Result<Vec<ScanHistoryItem>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let value = call(method::SCAN_HISTORY, Value::Null)?;
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Workaround for WebKitGTK crashing on NVIDIA + Wayland with
@@ -114,6 +163,8 @@ fn main() {
             daemon_status,
             survey,
             scan,
+            scan_cancel,
+            scan_history,
             quarantine_list,
             quarantine_restore,
             quarantine_delete

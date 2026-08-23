@@ -10,12 +10,14 @@
     Terminal,
   } from "@lucide/svelte";
   import * as api from "../lib/api";
-  import type { StatusResult, SurveyReport } from "../lib/types";
+  import { fmtRel } from "../lib/format";
+  import type { ScanHistoryItem, StatusResult, SurveyReport } from "../lib/types";
 
   let { onquickscan }: { onquickscan: (paths: string[]) => void } = $props();
 
   let status = $state<StatusResult | null>(null);
   let report = $state<SurveyReport | null>(null);
+  let lastScan = $state<ScanHistoryItem | null>(null);
   let daemonUp = $state(true);
   let loading = $state(true);
 
@@ -32,6 +34,12 @@
       report = await api.survey();
     } catch {
       report = null;
+    }
+    try {
+      const h = await api.scanHistory();
+      lastScan = h[0] ?? null;
+    } catch {
+      lastScan = null;
     }
     loading = false;
   }
@@ -114,6 +122,15 @@
             <span>Quarantined</span
             ><span class="font-mono text-ink">{status.quarantined_items}</span>
           </div>
+          {#if lastScan}
+            <div class="flex justify-between">
+              <span>Last scan</span
+              ><span class="font-mono text-ink"
+                >{lastScan.kind} · {fmtRel(lastScan.started_at)} · {lastScan.threats_found}
+                threat(s)</span
+              >
+            </div>
+          {/if}
         </div>
       {/if}
     </div>

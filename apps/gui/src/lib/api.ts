@@ -4,6 +4,7 @@ import type {
   QuarantineItem,
   ScanProgress,
   ScanResult,
+  ScanHistoryItem,
   Detection,
   StatusResult,
   SurveyReport,
@@ -17,8 +18,20 @@ export function survey(): Promise<SurveyReport> {
   return invoke<SurveyReport>("survey");
 }
 
-export function scan(paths: string[], quarantine: boolean): Promise<ScanResult> {
-  return invoke<ScanResult>("scan", { paths, quarantine });
+export function scan(
+  paths: string[],
+  quarantine: boolean,
+  kind: string,
+): Promise<ScanResult> {
+  return invoke<ScanResult>("scan", { paths, quarantine, kind });
+}
+
+export function scanCancel(scanId: number): Promise<number> {
+  return invoke<number>("scan_cancel", { scanId });
+}
+
+export function scanHistory(): Promise<ScanHistoryItem[]> {
+  return invoke<ScanHistoryItem[]>("scan_history");
 }
 
 export function quarantineList(): Promise<QuarantineItem[]> {

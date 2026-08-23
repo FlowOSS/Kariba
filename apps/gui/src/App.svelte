@@ -24,7 +24,7 @@
       {#if view === "dashboard"}
         <Dashboard onquickscan={quickScan} />
       {:else if view === "scan"}
-        <ScanView preset={scanPreset} />
+        <ScanView preset={scanPreset} onnavigate={(v) => (view = v)} />
       {:else if view === "quarantine"}
         <Quarantine />
       {:else}
