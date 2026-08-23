@@ -8,4 +8,6 @@ repository.workspace = true
 [dependencies]
 clap.workspace = true
 kariba-core.workspace = true
+kariba-ipc.workspace = true
 kariba-survey.workspace = true
+serde_json.workspace = true
