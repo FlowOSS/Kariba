@@ -1,0 +1,42 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type {
+  QuarantineItem,
+  ScanProgress,
+  ScanResult,
+  Detection,
+  StatusResult,
+  SurveyReport,
+} from "./types";
+
+export function daemonStatus(): Promise<StatusResult> {
+  return invoke<StatusResult>("daemon_status");
+}
+
+export function survey(): Promise<SurveyReport> {
+  return invoke<SurveyReport>("survey");
+}
+
+export function scan(paths: string[], quarantine: boolean): Promise<ScanResult> {
+  return invoke<ScanResult>("scan", { paths, quarantine });
+}
+
+export function quarantineList(): Promise<QuarantineItem[]> {
+  return invoke<QuarantineItem[]>("quarantine_list");
+}
+
+export function quarantineRestore(id: number): Promise<string> {
+  return invoke<string>("quarantine_restore", { id });
+}
+
+export function quarantineDelete(id: number): Promise<boolean> {
+  return invoke<boolean>("quarantine_delete", { id });
+}
+
+export function onScanProgress(cb: (p: ScanProgress) => void): Promise<UnlistenFn> {
+  return listen<ScanProgress>("kariba://scan-progress", (event) => cb(event.payload));
+}
+
+export function onScanDetection(cb: (d: Detection) => void): Promise<UnlistenFn> {
+  return listen<Detection>("kariba://scan-detection", (event) => cb(event.payload));
+}

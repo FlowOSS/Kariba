@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "apps/cli",
+    "apps/gui/src-tauri",
     "crates/karibad",
     "crates/kariba-core",
     "crates/kariba-ipc",

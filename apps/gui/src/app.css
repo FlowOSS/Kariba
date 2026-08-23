@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: oklch(0.145 0.004 285);
+  --color-surface: oklch(0.185 0.005 285);
+  --color-surface-2: oklch(0.225 0.006 285);
+  --color-edge: oklch(0.305 0.008 285);
+  --color-ink: oklch(0.93 0.003 285);
+  --color-muted: oklch(0.65 0.01 285);
+  --color-accent: oklch(0.78 0.13 180);
+  --color-ok: oklch(0.77 0.15 165);
+  --color-warn: oklch(0.82 0.16 85);
+  --color-danger: oklch(0.66 0.2 25);
+
+  --font-sans: "Geist", "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+#app {
+  height: 100%;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-edge);
+  border-radius: 5px;
+  border: 2px solid var(--color-bg);
+}
+
+::selection {
+  background: color-mix(in oklch, var(--color-accent) 30%, transparent);
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-edge bg-surface;
+  }
+  .btn {
+    @apply inline-flex cursor-pointer items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium transition-all disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .btn-primary {
+    @apply bg-accent text-bg hover:brightness-110 active:scale-[0.98];
+  }
+  .btn-ghost {
+    @apply border border-edge bg-surface-2 text-ink hover:bg-edge/50;
+  }
+  .btn-danger {
+    @apply border border-danger/40 bg-danger/10 text-danger hover:bg-danger/20;
+  }
+  .label {
+    @apply text-xs font-medium tracking-wider text-muted uppercase;
+  }
+}
+
+@keyframes slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
