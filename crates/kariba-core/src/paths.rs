@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn runtime_dir() -> PathBuf {
     let system = PathBuf::from("/run/kariba");
@@ -46,6 +46,19 @@ pub fn quarantine_dir() -> PathBuf {
     data_dir().join("quarantine")
 }
 
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return home().unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(h) = home()
+    {
+        return h.join(rest);
+    }
+    path.to_path_buf()
+}
+
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -74,5 +87,13 @@ mod tests {
     #[test]
     fn uid_is_present() {
         assert!(current_uid().is_some());
+    }
+
+    #[test]
+    fn expand_tilde_uses_home() {
+        let expanded = expand_tilde(Path::new("~/Downloads"));
+        assert!(!expanded.to_string_lossy().starts_with('~'));
+        assert!(expanded.ends_with("Downloads"));
+        assert_eq!(expand_tilde(Path::new("/tmp/x")), PathBuf::from("/tmp/x"));
     }
 }

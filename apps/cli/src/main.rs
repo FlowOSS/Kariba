@@ -84,6 +84,10 @@ fn main() {
             }
         },
         Command::Scan { paths, quarantine } => match with_daemon(|client| {
+            let paths = paths
+                .iter()
+                .map(|p| kariba_core::paths::expand_tilde(p))
+                .collect();
             let params = ScanParams { paths, quarantine };
             let interactive = std::io::stdout().is_terminal();
             let value = client.call_with_notifications(
