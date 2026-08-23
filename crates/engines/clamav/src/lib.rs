@@ -2,7 +2,10 @@ use kariba_core::clamav;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const KEEPALIVE_AFTER: Duration = Duration::from_secs(3);
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanOutcome {
@@ -14,6 +17,7 @@ pub enum ScanOutcome {
 pub struct ClamdClient {
     reader: BufReader<UnixStream>,
     stream: UnixStream,
+    last_command: Instant,
 }
 
 impl ClamdClient {
@@ -22,9 +26,13 @@ impl ClamdClient {
         for candidate in clamav::socket_candidates() {
             match UnixStream::connect(&candidate) {
                 Ok(stream) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+                    stream.set_read_timeout(Some(READ_TIMEOUT))?;
                     let reader = BufReader::new(stream.try_clone()?);
-                    return Ok(Self { reader, stream });
+                    return Ok(Self {
+                        reader,
+                        stream,
+                        last_command: Instant::now(),
+                    });
                 }
                 Err(e) => last_error = Some(e),
             }
@@ -35,12 +43,44 @@ impl ClamdClient {
     }
 
     pub fn scan_path(&mut self, path: &Path) -> io::Result<ScanOutcome> {
+        match self.scan_once(path) {
+            Ok(outcome) => Ok(outcome),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                *self = Self::connect()?;
+                self.scan_once(path)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn scan_once(&mut self, path: &Path) -> io::Result<ScanOutcome> {
+        if self.last_command.elapsed() > KEEPALIVE_AFTER {
+            self.keepalive()?;
+        }
         let command = format!("SCAN {}\n", path.display());
         self.stream.write_all(command.as_bytes())?;
         self.stream.flush()?;
         let mut line = String::new();
         self.reader.read_line(&mut line)?;
+        self.last_command = Instant::now();
         Ok(parse_scan_response(&line))
+    }
+
+    fn keepalive(&mut self) -> io::Result<()> {
+        self.stream.write_all(b"VERSION\n")?;
+        self.stream.flush()?;
+        let mut line = String::new();
+        self.reader.read_line(&mut line)?;
+        self.last_command = Instant::now();
+        Ok(())
     }
 }
 
