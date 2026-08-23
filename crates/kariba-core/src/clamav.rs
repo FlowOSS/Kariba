@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 pub const CLAMD_CONF: &str = "/etc/clamav/clamd.conf";
 pub const FRESHCLAM_CONF: &str = "/etc/clamav/freshclam.conf";
@@ -70,6 +71,28 @@ pub fn db_dir_from_config(content: &str) -> Option<String> {
     None
 }
 
+pub fn daily_db_file() -> Option<(PathBuf, SystemTime)> {
+    daily_db_file_in(&db_dir())
+}
+
+pub fn daily_db_file_in(dir: &std::path::Path) -> Option<(PathBuf, SystemTime)> {
+    let mut best: Option<(PathBuf, SystemTime)> = None;
+    for name in ["daily.cvd", "daily.cld"] {
+        let candidate = dir.join(name);
+        let Ok(metadata) = fs::metadata(&candidate) else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        match &best {
+            Some((_, current)) if *current >= modified => {}
+            _ => best = Some((candidate, modified)),
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +122,25 @@ mod tests {
     fn candidates_start_with_configured() {
         let candidates = socket_candidates();
         assert!(!candidates.is_empty());
+    }
+
+    #[test]
+    fn daily_db_prefers_newest_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let cvd = dir.path().join("daily.cvd");
+        fs::write(&cvd, b"old").unwrap();
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let cld = dir.path().join("daily.cld");
+        fs::write(&cld, b"new").unwrap();
+        let file = fs::File::open(&cld).unwrap();
+        file.set_modified(old_time + std::time::Duration::from_secs(120))
+            .unwrap();
+
+        let (path, _) = daily_db_file_in(dir.path()).unwrap();
+        assert_eq!(path, cld);
+
+        fs::remove_file(&cld).unwrap();
+        let (path, _) = daily_db_file_in(dir.path()).unwrap();
+        assert_eq!(path, cvd);
     }
 }

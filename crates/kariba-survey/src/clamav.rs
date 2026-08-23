@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::report::{CheckResult, CheckStatus};
 
@@ -144,13 +144,10 @@ fn query_version(stream: &mut UnixStream) -> Option<String> {
 }
 
 fn check_database(distro: &Distro, results: &mut Vec<CheckResult>) {
-    let dir = clamav::db_dir();
-    let daily = dir.join("daily.cvd");
-
-    let metadata = match fs::metadata(&daily) {
-        Ok(m) => m,
-        Err(_) => {
-            let detail = format!("no signature database in {}", dir.display());
+    let daily = match clamav::daily_db_file() {
+        Some(daily) => daily,
+        None => {
+            let detail = format!("no signature database in {}", clamav::db_dir().display());
             let suggestion = if find_in_path("freshclam").is_none() {
                 install_cmd(distro.family)
             } else {
@@ -161,13 +158,13 @@ fn check_database(distro: &Distro, results: &mut Vec<CheckResult>) {
         }
     };
 
-    let age = metadata
-        .modified()
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .unwrap_or(Duration::ZERO);
+    let age = daily.1.elapsed().ok().unwrap_or(Duration::ZERO);
     let days = age.as_secs() / (24 * 3600);
-    let detail = format!("daily.cvd is {} day(s) old", days);
+    let detail = format!(
+        "{} is {} day(s) old",
+        daily.0.file_name().unwrap_or_default().to_string_lossy(),
+        days
+    );
 
     if age > DB_FAIL_AGE {
         results.push(fail(
