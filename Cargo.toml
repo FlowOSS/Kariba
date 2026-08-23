@@ -20,6 +20,8 @@ kariba-core = { path = "crates/kariba-core" }
 kariba-ipc = { path = "crates/kariba-ipc" }
 kariba-survey = { path = "crates/kariba-survey" }
 kariba-engine-clamav = { path = "crates/engines/clamav" }
+clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
