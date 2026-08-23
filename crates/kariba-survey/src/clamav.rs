@@ -1,3 +1,4 @@
+use kariba_core::clamav;
 use kariba_core::{Distro, DistroFamily, InitSystem};
 use std::fmt::Write as _;
 use std::fs;
@@ -9,15 +10,6 @@ use std::time::{Duration, SystemTime};
 use crate::report::{CheckResult, CheckStatus};
 
 const ENGINE: &str = "ClamAV";
-const CLAMD_CONF: &str = "/etc/clamav/clamd.conf";
-const FRESHCLAM_CONF: &str = "/etc/clamav/freshclam.conf";
-const DEFAULT_SOCKETS: &[&str] = &[
-    "/run/clamav/clamd.ctl",
-    "/var/run/clamav/clamd.ctl",
-    "/var/run/clamav/clamd.sock",
-    "/tmp/clamd.socket",
-];
-const DEFAULT_DB_DIR: &str = "/var/lib/clamav";
 const DB_WARN_AGE: Duration = Duration::from_secs(3 * 24 * 3600);
 const DB_FAIL_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -93,7 +85,6 @@ fn check_service(distro: &Distro, init: InitSystem, results: &mut Vec<CheckResul
         return;
     }
 
-    let component = "clamd process";
     let detail = "not running".to_string();
     let suggestion = match init {
         InitSystem::OpenRc => {
@@ -106,7 +97,7 @@ fn check_service(distro: &Distro, init: InitSystem, results: &mut Vec<CheckResul
         InitSystem::Systemd => Some("sudo systemctl start clamav-daemon".into()),
         _ => None,
     };
-    results.push(fail(component, detail, suggestion));
+    results.push(fail("clamd process", detail, suggestion));
 }
 
 fn process_running(name: &str) -> bool {
@@ -123,43 +114,8 @@ fn process_running(name: &str) -> bool {
     false
 }
 
-fn socket_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(configured) = configured_socket() {
-        candidates.push(PathBuf::from(configured));
-    }
-    for path in DEFAULT_SOCKETS {
-        let path = PathBuf::from(path);
-        if !candidates.contains(&path) {
-            candidates.push(path);
-        }
-    }
-    candidates
-}
-
-fn configured_socket() -> Option<String> {
-    let content = fs::read_to_string(CLAMD_CONF).ok()?;
-    socket_from_config(&content)
-}
-
-fn socket_from_config(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("LocalSocket") {
-            let path = rest.trim();
-            if !path.is_empty() {
-                return Some(path.to_string());
-            }
-        }
-    }
-    None
-}
-
 fn check_socket(results: &mut Vec<CheckResult>) {
-    for path in socket_candidates() {
+    for path in clamav::socket_candidates() {
         if let Ok(mut stream) = UnixStream::connect(&path) {
             let detail = match query_version(&mut stream) {
                 Some(version) => format!("{} — {}", path.display(), version),
@@ -188,17 +144,18 @@ fn query_version(stream: &mut UnixStream) -> Option<String> {
 }
 
 fn check_database(distro: &Distro, results: &mut Vec<CheckResult>) {
-    let dir = db_dir();
+    let dir = clamav::db_dir();
     let daily = dir.join("daily.cvd");
 
     let metadata = match fs::metadata(&daily) {
         Ok(m) => m,
         Err(_) => {
             let detail = format!("no signature database in {}", dir.display());
-            let mut suggestion = String::from("sudo freshclam");
-            if find_in_path("freshclam").is_none() {
-                suggestion = install_cmd(distro.family);
-            }
+            let suggestion = if find_in_path("freshclam").is_none() {
+                install_cmd(distro.family)
+            } else {
+                "sudo freshclam".into()
+            };
             results.push(fail("signature database", detail, Some(suggestion)));
             return;
         }
@@ -229,30 +186,6 @@ fn check_database(distro: &Distro, results: &mut Vec<CheckResult>) {
     }
 }
 
-fn db_dir() -> PathBuf {
-    fs::read_to_string(FRESHCLAM_CONF)
-        .ok()
-        .and_then(|content| db_dir_from_config(&content))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_DIR))
-}
-
-fn db_dir_from_config(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("DatabaseDirectory") {
-            let value = rest.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
-
 fn install_cmd(family: DistroFamily) -> String {
     match family {
         DistroFamily::Arch => "sudo pacman -S clamav".into(),
@@ -276,27 +209,6 @@ fn init_pkg_hint(family: DistroFamily, init: InitSystem) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_local_socket_from_config() {
-        let content = "# comment\nLocalSocket /run/clamav/clamd.ctl\n";
-        assert_eq!(
-            socket_from_config(content),
-            Some("/run/clamav/clamd.ctl".into())
-        );
-    }
-
-    #[test]
-    fn ignores_commented_socket() {
-        let content = "#LocalSocket /tmp/old.sock\n";
-        assert_eq!(socket_from_config(content), None);
-    }
-
-    #[test]
-    fn parses_db_dir_from_config() {
-        let content = "DatabaseDirectory /var/lib/clamav\n";
-        assert_eq!(db_dir_from_config(content), Some("/var/lib/clamav".into()));
-    }
 
     #[test]
     fn install_cmd_per_family() {
