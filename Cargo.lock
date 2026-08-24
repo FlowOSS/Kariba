@@ -1810,7 +1810,7 @@ dependencies = [
 
 [[package]]
 name = "kariba-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "clap",
  "kariba-core",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "kariba-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "tempfile",
@@ -1830,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "kariba-engine-clamav"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "kariba-core",
  "tempfile",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "kariba-gui"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "kariba-core",
  "kariba-ipc",
@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "kariba-ipc"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "kariba-core",
  "serde",
@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "kariba-survey"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "kariba-core",
  "serde",
@@ -1868,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "karibad"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "kariba-core",
  "kariba-engine-clamav",
