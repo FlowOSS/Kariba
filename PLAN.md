@@ -264,7 +264,9 @@ it (or a user can run it in a terminal during development). What we ship in
 ## Real-time Protection Design
 
 Decisions locked 2026-08-24 (threat-model review: "malware drops files
-anywhere" + "AUR supply-chain hijack").
+anywhere" + "AUR supply-chain hijack"). Redesigned 2026-08-24 after a
+20k-file burst froze the dev machine (see "Burst handling & completeness"
+for the incident and the safety rules that came out of it).
 
 **Watch scope — mount-wide.** fanotify marks are per-mount, so karibad marks
 each relevant local mount once rather than watching directories. Covered:
@@ -276,14 +278,31 @@ remote bytes synchronously would hang local syscalls). Mounts are discovered
 from `/proc/self/mountinfo`; the exclusions settings (already shipped) decide
 what inside a marked mount is skipped.
 
-**Events.** Two masks per mount:
+**Events — one blocking surface, everything else async.** fanotify
+permission events block the calling process until karibad answers;
+notification events never block anyone. The design keeps exactly ONE
+blocking surface:
 
-- `FAN_OPEN_EXEC_PERM` — the exec gate. Synchronous: karibad must ALLOW or
-  DENY before the execve completes. This is the security boundary — a
-  detected payload is refused execution no matter where it landed.
-- `FAN_CLOSE_WRITE` — scan-on-landing. Asynchronous: queued for scanning, no
-  syscall is held. Detections feed the threats table, honor
-  `realtime.auto_quarantine`, and broadcast to connected clients.
+- `FAN_OPEN_EXEC_PERM` — the exec gate, the sole synchronous path. karibad
+  must ALLOW or DENY before the execve completes. This is the security
+  boundary: a detected payload is refused execution no matter where it
+  landed. Heavily protected against lockups (see "Exec gate lockup
+  prevention").
+- `FAN_CLOSE_WRITE` (notification) — detect-at-landing. Content just
+  changed, so it is enqueued for scanning in the priority queue. Detections
+  feed the threats table, honor `realtime.auto_quarantine`, and broadcast
+  to connected clients.
+- `FAN_OPEN` (notification) — cache-first read check. On any open, intake
+  looks the file up in the verdict cache: clean-and-unchanged → drop the
+  event (zero engine work); never-scanned or changed → enqueue an async
+  scan. This catches files that landed while karibad was off or existed
+  before it started. Cost is a hashmap lookup per open in steady state;
+  the toggle is `realtime.scan_on_read`.
+
+An earlier revision considered `FAN_OPEN_PERM` for read checks — rejected:
+it would block every file open on the watched mounts, which is precisely
+the freeze machine this design must never build. Reads are a soft
+boundary; the hard boundary is the exec gate.
 
 **Verdict policy — fail-open + re-scan.** Permission events hold the calling
 process's syscall, so a slow verdict is user-visible. karibad bounds every
@@ -294,9 +313,113 @@ bigger liability than the residual race, and detection quality (not syscall
 blocking) is where the actual protection comes from. clamd being down
 degrades protection visibly in `status`/dashboard rather than silently.
 
-**Verdict cache.** In-memory `(path, mtime, size) → verdict` so normal
-exec/open churn doesn't round-trip to clamd. sha256 is computed only on
-detection (threat records), keeping the hot path at stat + hashmap lookup.
+**Exec gate lockup prevention.** "Nothing executes anywhere without a
+verdict" must never be able to freeze the machine, so the exec gate — the
+only blocking surface — is defended in depth:
+
+- **L1 per-verdict bound** — cache hit instant; miss = engine scan with a
+  hard 2s timeout; timeout/engine-down = ALLOW + P0 re-scan queue. One
+  exec never waits more than the bound.
+- **L2 per-batch budget** — a batch may carry many exec events; verdict
+  scans get a total budget (~1s) per batch. Budget spent → remaining
+  cache-miss execs ALLOW + P0 re-scan. Worst-case exec latency is bounded
+  regardless of clamd congestion.
+- **L3 respond-first** — the ALLOW/DENY write happens before ANY
+  bookkeeping (DB writes, quarantine move — which can be a slow
+  cross-mount copy — broadcast). Detection handling runs after the
+  response, quarantine through the P0 lane. Bookkeeping never delays a
+  verdict.
+- **L4 intake watchdog** — see Burst handling: a stalled intake closes the
+  fanotify fd within seconds, kernel auto-allows every pending exec,
+  watcher restarts.
+- **L5 bounded shutdown** — stop() closes the fd first, interrupts
+  workers, joins briefly; SIGTERM uses the same path.
+- **L6 structural scope** — `/usr` and `/boot` are excluded from the exec
+  gate by default (user-removable settings entries, GUI warns like other
+  built-ins): boot, systemd services, and package transactions never wait
+  on karibad, so the blast radius of any residual gate problem excludes
+  the system itself. Close-write scanning of those paths still runs
+  async; `/usr` integrity is AIDE's job (Phase 2). This is the same fence
+  clamonacc draws (it refuses prevention on whole mounts).
+- **Emergency lever** — `kill -9 karibad` is always safe: fd closes,
+  kernel auto-allows everything. Documented as the user's oh-shit handle.
+
+**Verdict cache.** In-memory `(device, inode, mtime, size) → verdict` —
+rename-proof, and "unchanged since last verdict" is answered without
+hashing. Populated by every completed scan (landing, read-miss, catch-up,
+exec verdict); a file scanned once is never scanned again until it changes.
+sha256 is computed only on detection (threat records), keeping the hot path
+at stat + hashmap lookup.
+
+**Triage — risk-based lanes.** Not every file deserves equal urgency:
+executables are the only class that can act on their own, so they are
+prioritized; media is inert until something consumes it, so it yields
+under load. Intake classifies with zero I/O (exec bit, extension, path
+heuristics) into lanes drained in priority order EXEC → DATA → MEDIA by a
+worker pool (4 persistent clamd connections):
+
+- **EXEC** — exec bit set, `*.so`, files under `*/bin`, `*/sbin`,
+  `*/libexec`, AppImages: highest priority.
+- **DATA** — archives, documents, code/scripts, unknown: normal queue.
+- **MEDIA** — png/jpg/gif/webp/mp3/mp4/ttf/woff and friends: lowest
+  priority; first to be load-shed when the queue overflows its cap (shed
+  paths spill to `pending_scans`, so nothing is lost).
+- **CHURN** — live databases and logs (sqlite/-wal/-journal, bdb, …):
+  per-path cooldown, re-scanned at most every few seconds, latest-wins —
+  constantly-rewritten files must not drown the queue.
+
+Classification is a scheduling decision, not a security decision: a MEDIA
+file that tests positive is still detected, quarantined, and broadcast
+like any other; it simply waits its turn behind executables.
+
+**Burst handling & completeness.** An AV must not silently drop files, so
+the async pipeline is built for bursts (a package manager or game download
+writing thousands of files at once) — and it must survive them without
+taking the system down. The 2026-08-24 incident: a 20k-file burst with
+`FAN_UNLIMITED_QUEUE` and a shutdown that joined worker threads before
+closing the fanotify fd left the fd open and unread; the kernel then
+queued every write on the system with a pinned fd + inode each until the
+machine froze (orphaned inodes confirmed at reboot). Safety rules that
+follow:
+
+- **Never leave the fanotify fd open and unread.** It is the only resource
+  that can turn a karibad stall into a system-wide leak. Shutdown closes
+  it FIRST (one syscall — frees marks and the kernel queue, cannot
+  deadlock), then persists queued paths, then interrupts workers by
+  closing their clamd sockets, then joins briefly. `kill -9 karibad` is
+  always safe for the same reason: fd closes, kernel frees everything,
+  pending permission events auto-allow.
+- **Bounded kernel queue.** No `FAN_UNLIMITED_QUEUE`. On `FAN_Q_OVERFLOW`
+  (kernel dropped events) the affected mount is marked degraded, logged
+  once, and scheduled for a catch-up sweep with the on-demand scanner —
+  loss is detectable and recovered, never silent. The kernel queue limit
+  is `/proc/sys/fs/fanotify/max_queued_events` (default 16384).
+- **Intake never does slow work.** Resolve path, close event fd,
+  classify, enqueue — microseconds per event. Permission events in a
+  batch are answered before anything else; the backlog lives as cheap
+  path strings in userspace, never as kernel-pinned fds.
+- **Queue overflow spills, never drops.** The dedup'd in-memory queue
+  (same path N times ⇒ one scan of the final content) spills entries
+  beyond its cap to the `pending_scans` SQLite table; workers drain
+  memory first, then the table, which is reloaded after a restart.
+  Graceful shutdown persists whatever is still queued (a SIGKILL loses
+  only what was in memory at that instant).
+- **Intake watchdog.** A tiny watchdog thread checks intake's heartbeat;
+  if it stops making progress for ~3s (deadlock, stuck syscall, any bug
+  class), the watchdog closes the fanotify fd — kernel auto-allows all
+  pending permission events — and restarts the watcher. Repeated failure
+  puts karibad into a visible failed-open mode. A stalled karibad becomes
+  a fail-open karibad in seconds instead of a frozen machine.
+- **clamd is protected from itself.** Worker read timeout is 30s (not
+  minutes), and a circuit breaker pauses scanning briefly after repeated
+  errors while verdicts fail open. karibad raises its own `RLIMIT_NOFILE`
+  to the hard limit at startup.
+- Errors are suppressed per path for 60s and EMFILE triggers a back-off
+  sleep.
+- Residual risk: events landing while karibad is not running are lost (no
+  daemon, no events) — mitigated by `FAN_OPEN` read checks (first open of
+  an unscanned file scans it), service supervision with restart-on-crash
+  in the packaging phase, and scheduled sweeps.
 
 **Privilege & degradation.** `FAN_CLASS_CONTENT` requires CAP_SYS_ADMIN: a
 non-root dev daemon reports `realtime_active = false` with the reason and
@@ -314,13 +437,21 @@ clamd (`zINSTREAM`) instead of sending paths: the daemon runs as root and
 can open anything, while clamd runs as the unprivileged `clamav` user,
 which cannot traverse mode-700 home directories — path-based `SCAN`
 silently misses every file in a private home (discovered in E2E testing
-2026-08-24). Files beyond clamd's `StreamMaxLength` (default 25 MB) fall
-back to path-based SCAN. INSTREAM responses are NUL-terminated, unlike
-SCAN's newline-terminated replies.
+2026-08-24). Files beyond clamd's `StreamMaxLength` (default 25 MB) can't
+be streamed, so karibad copies them to a world-readable scratch dir
+(`/tmp/kariba-bigscan`) and SCANs the copy (root reads anything, clamav
+reads the copy); the copy is deleted after. Raising `StreamMaxLength` in
+clamd.conf avoids the copy. INSTREAM responses are NUL-terminated, unlike
+SCAN's newline-terminated replies. The copy approach does not scale to
+very large files — see Known Issues #3.
 
-**Known race.** Between close-write and its async verdict, a non-exec read
-can touch a fresh file. Accepted: the exec gate closes the dangerous path
-(files that merely get read can't run code), matching the minifilter model.
+**Known races & gaps.** Between close-write and its async verdict, a
+non-exec read can touch a fresh file; read checks are a soft boundary (an
+app can open a malicious document before the async scan lands). Accepted:
+the exec gate closes the dangerous path — files that merely get read can't
+run code — matching the minifilter model. Also accepted: `mmap`ed writes
+generate no fanotify events at all (kernel limitation); coverage there
+comes from scheduled/on-demand sweeps, not the watcher.
 
 **Why our own watcher instead of ClamAV's `clamonacc`.** ClamAV ships an
 optional on-access scanner (`clamonacc`, also fanotify-based), but it is a
@@ -331,22 +462,43 @@ watcher inside karibad lets real-time protection obey Kariba settings
 quarantine with mode 000), and broadcast verdicts to CLI/GUI over the
 existing IPC.
 
+**Why not clamonacc — decision (2026-08-24).** Evaluated and rejected as
+the real-time core, kept in mind as a coexistence check for Survey:
+(1) its prevention mode (`OnAccessPrevention`) only works on
+directory-based include paths — mount-wide is notify-only by its own docs
+("would lock up the system") — so adopting it would downgrade our
+mount-wide exec gate; (2) detections would reach karibad second-hand via
+log parsing or by watching its `--move` directory, turning the DB/GUI/
+quarantine pipeline into scraped data; (3) its config lives in
+`clamd.conf`, owned by the distro package and overwritten on updates;
+(4) two root daemons, doubled fanotify overhead. What we took from it
+instead: engine-process exclusion, catch-up/extra-scanning as first-class
+recovery, and tuning knobs (`MaxThreads`, `MaxQueue`). Survey should
+eventually detect a separately-running clamonacc and warn about
+double-scanning conflicts.
+
 ## Features
 
 ### Core Features
 
 1. **Real-time Protection**
-   - fanotify permission events (`FAN_OPEN_EXEC_PERM`, `FAN_OPEN_PERM`)
+   - fanotify: exec gate (`FAN_OPEN_EXEC_PERM`) as the sole synchronous
+     surface; async scan-on-landing (`FAN_CLOSE_WRITE`) and cache-first
+     read checks (`FAN_OPEN`, toggle `realtime.scan_on_open`)
    - Block execution / scan on create-modify-close
    - Auto-quarantine detected threats
-   - Configurable exclusions (paths, file types, processes)
+   - Configurable exclusions (paths, file types, processes); `/usr` and
+     `/boot` excluded from the exec gate by default (user-removable)
+   - Risk-based triage: EXEC → DATA → MEDIA priority lanes, churn
+     cooldown for live databases, `(dev, inode, mtime, size)` verdict
+     cache so unchanged files are never re-scanned
    - Catches files regardless of arrival vector (browser download, archive
      extraction, USB copy): everything lands on disk and passes fanotify.
      Encrypted archives are never decrypted — extracted files are scanned on
      landing, same model as Windows Defender's minifilter
    - Synchronous verdicts: permission events hold the syscall until karibad
-     allows/denies, so scan latency is user-visible; needs a timeout policy
-     (fail-open + background re-scan vs. deny)
+     allows/denies, so scan latency is user-visible — bounded, fail-open,
+     and lockup-protected (see Real-time Protection Design)
    - **Watch scope (decided 2026-08-24): mount-wide from day 1.** fanotify
      marks are per-mount, so marking the root/home/tmp/removable mounts
      covers files dropped *anywhere* on those filesystems — not just
@@ -779,6 +931,20 @@ Exposed during GUI testing (2026-08-23) — fix before alpha:
    dot on the sidebar tab; the Dashboard status card no longer carries a
    detection list. Still open: desktop notifications and a system tray for
    when the GUI is closed or unfocused.
+3. **Oversized-file scanning is a copy today** — files beyond clamd's
+   `StreamMaxLength` (25 MB default) get copied to `/tmp/kariba-bigscan`
+   and SCAN'd as the copy. Fine at 30 MB, absurd at 100–500 GB (time +
+   disk doubling). Candidate fixes, likely combined:
+   - Raise `StreamMaxLength` in clamd.conf (clamd spools INSTREAM to its
+     TemporaryDirectory, so memory stays bounded; karibad streams bytes as
+     root, so no copy is needed at all) — Survey should hint this.
+   - Hardlink instead of copy when the file's filesystem matches the
+     scratch dir and permissions allow (zero-copy, instant) — useless for
+     mode-700 homes, where the copy exists in the first place.
+   - Reflink copies on CoW filesystems (btrfs/xfs) where supported.
+   - Above a sane cap: don't copy and don't pretend clean — record an
+     explicit "skipped (too large)" verdict in history so coverage gaps
+     are visible, never silent.
 
 Resolved (2026-08-23): DB lock held for whole scan (scanner now takes
 short-lived locks per DB operation; GUI commands are async, so status /
@@ -852,7 +1018,9 @@ names free; no conflicting security product; GitHub org handled by
     detected on landing (respecting `auto_quarantine`), exec attempt denied
     by the gate (`Operation not permitted`, exit 126), re-enabled
     auto-quarantine moved the file on the next blocked exec.
-11. Packaging: systemd unit `[ASSUMPTION]` + OpenRC script
+11. Packaging: systemd unit `[ASSUMPTION]` + OpenRC script (unit needs
+    `Restart=always`-class supervision — events landing while karibad is
+    down are lost — and a raised `LimitNOFILE` headroom for bursts)
 12. Push to `FlowOSS/kariba`, alpha release for community feedback
 
 **Versioning.** Kariba follows semver strictly. Everything pre-release lives
