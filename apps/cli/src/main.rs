@@ -1,7 +1,9 @@
 use clap::{Args, Parser, Subcommand};
+use kariba_core::config::Settings;
 use kariba_core::paths;
 use kariba_ipc::protocol::{
-    IdParams, QuarantineItem, ScanParams, ScanProgress, ScanResult, StatusResult, method,
+    IdParams, QuarantineItem, ScanParams, ScanProgress, ScanResult, SettingsSetParams,
+    StatusResult, method,
 };
 use kariba_ipc::{Client, Notification};
 use kariba_survey::{CheckStatus, SurveyReport, run_survey};
@@ -27,12 +29,31 @@ enum Command {
         /// Paths to scan
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// Quarantine detected threats automatically
-        #[arg(long)]
+        /// Quarantine detected threats (overrides the daemon default)
+        #[arg(long, conflicts_with = "no_quarantine")]
         quarantine: bool,
+        /// Do not quarantine detected threats (overrides the daemon default)
+        #[arg(long)]
+        no_quarantine: bool,
     },
     /// Manage quarantined files
     Quarantine(QuarantineArgs),
+    /// View or change daemon settings
+    Settings(SettingsArgs),
+}
+
+#[derive(Args)]
+struct SettingsArgs {
+    #[command(subcommand)]
+    action: Option<SettingsAction>,
+}
+
+#[derive(Subcommand)]
+enum SettingsAction {
+    /// Change one setting, e.g. `set realtime.enabled false`
+    Set { key: String, value: String },
+    /// Re-add any missing built-in exclusions (/proc, /sys, /dev, /run)
+    RestoreBuiltins,
 }
 
 #[derive(Args)]
@@ -68,8 +89,14 @@ fn main() {
             let status: StatusResult = serde_json::from_value(value)
                 .map_err(|e| kariba_ipc::RpcError::new(-32000, e.to_string()))?;
             println!(
-                "karibad {} · up {}s",
-                status.daemon_version, status.uptime_secs
+                "karibad {} · up {}s · protection {}",
+                status.daemon_version,
+                status.uptime_secs,
+                if status.protection_enabled {
+                    "on"
+                } else {
+                    "off"
+                }
             );
             println!(
                 "scans: {} · threats: {} · quarantined: {}",
@@ -83,7 +110,11 @@ fn main() {
                 1
             }
         },
-        Command::Scan { paths, quarantine } => match with_daemon(|client| {
+        Command::Scan {
+            paths,
+            quarantine,
+            no_quarantine,
+        } => match with_daemon(|client| {
             let paths: Vec<PathBuf> = paths
                 .iter()
                 .map(|p| kariba_core::paths::expand_tilde(p))
@@ -91,6 +122,11 @@ fn main() {
             let kind = match paths.as_slice() {
                 [p] if p.as_os_str() == "/" => "full",
                 _ => "custom",
+            };
+            let quarantine = match (quarantine, no_quarantine) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
             };
             let params = ScanParams {
                 paths,
@@ -121,6 +157,13 @@ fn main() {
             }
         },
         Command::Quarantine(args) => match run_quarantine(args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        Command::Settings(args) => match run_settings(args) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{e}");
@@ -213,6 +256,91 @@ fn run_quarantine(args: QuarantineArgs) -> Result<i32, kariba_ipc::RpcError> {
             Ok(0)
         }),
     }
+}
+
+fn run_settings(args: SettingsArgs) -> Result<i32, kariba_ipc::RpcError> {
+    match args.action {
+        None => with_daemon(|client| {
+            let value = client.call(method::SETTINGS_GET, Value::Null)?;
+            let settings: Settings = serde_json::from_value(value)
+                .map_err(|e| kariba_ipc::RpcError::new(-32000, e.to_string()))?;
+            print!("{}", settings.to_toml());
+            Ok(0)
+        }),
+        Some(SettingsAction::Set { key, value }) => with_daemon(|client| {
+            let mut settings = get_settings(client)?;
+            apply_key(&mut settings, &key, &value)?;
+            set_settings(client, settings)?;
+            println!(
+                "{key} updated (saved to {})",
+                paths::config_path().display()
+            );
+            Ok(0)
+        }),
+        Some(SettingsAction::RestoreBuiltins) => with_daemon(|client| {
+            let mut settings = get_settings(client)?;
+            if settings.restore_builtins() {
+                set_settings(client, settings)?;
+                println!(
+                    "built-in exclusions restored (saved to {})",
+                    paths::config_path().display()
+                );
+            } else {
+                println!("all built-in exclusions already present");
+            }
+            Ok(0)
+        }),
+    }
+}
+
+fn get_settings(client: &mut Client) -> Result<Settings, kariba_ipc::RpcError> {
+    let value = client.call(method::SETTINGS_GET, Value::Null)?;
+    serde_json::from_value(value).map_err(|e| kariba_ipc::RpcError::new(-32000, e.to_string()))
+}
+
+fn set_settings(client: &mut Client, settings: Settings) -> Result<(), kariba_ipc::RpcError> {
+    let params = serde_json::to_value(SettingsSetParams { settings })
+        .map_err(|e| kariba_ipc::RpcError::new(-32000, e.to_string()))?;
+    client.call(method::SETTINGS_SET, params)?;
+    Ok(())
+}
+
+fn apply_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), kariba_ipc::RpcError> {
+    fn parse_bool(value: &str) -> Result<bool, kariba_ipc::RpcError> {
+        match value {
+            "true" | "on" | "1" => Ok(true),
+            "false" | "off" | "0" => Ok(false),
+            _ => Err(kariba_ipc::RpcError::new(
+                -32602,
+                format!("expected true/false, got: {value}"),
+            )),
+        }
+    }
+    fn parse_list(value: &str) -> Vec<String> {
+        value
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+    match key {
+        "realtime.enabled" => settings.realtime.enabled = parse_bool(value)?,
+        "realtime.auto_quarantine" => settings.realtime.auto_quarantine = parse_bool(value)?,
+        "scan.default_quarantine" => settings.scan.default_quarantine = parse_bool(value)?,
+        "exclusions.paths" => settings.exclusions.paths = parse_list(value),
+        "exclusions.extensions" => settings.exclusions.extensions = parse_list(value),
+        other => {
+            return Err(kariba_ipc::RpcError::new(
+                -32602,
+                format!(
+                    "unknown key: {other}. Valid keys: realtime.enabled, \
+                     realtime.auto_quarantine, scan.default_quarantine, \
+                     exclusions.paths, exclusions.extensions"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn print_survey(report: &SurveyReport) {

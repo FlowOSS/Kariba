@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
+pub use kariba_core::config::Settings;
+
 pub const VERSION: &str = "2.0";
 
 pub mod method {
@@ -14,6 +16,8 @@ pub mod method {
     pub const QUARANTINE_LIST: &str = "quarantine.list";
     pub const QUARANTINE_RESTORE: &str = "quarantine.restore";
     pub const QUARANTINE_DELETE: &str = "quarantine.delete";
+    pub const SETTINGS_GET: &str = "settings.get";
+    pub const SETTINGS_SET: &str = "settings.set";
 
     pub const SCAN_PROGRESS: &str = "scan.progress";
     pub const SCAN_DETECTION: &str = "scan.detection";
@@ -170,8 +174,9 @@ pub fn parse_line(line: &str) -> Result<WireMessage, RpcError> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanParams {
     pub paths: Vec<PathBuf>,
+    // None means "use the daemon's scan.default_quarantine setting".
     #[serde(default)]
-    pub quarantine: bool,
+    pub quarantine: Option<bool>,
     // "quick" | "full" | "custom" — recorded in scan history.
     #[serde(default = "default_scan_kind")]
     pub kind: String,
@@ -225,6 +230,12 @@ pub struct StatusResult {
     pub scans_total: u64,
     pub threats_total: u64,
     pub quarantined_items: u64,
+    pub protection_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingsSetParams {
+    pub settings: Settings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,12 +305,12 @@ mod tests {
     fn roundtrip_scan_params() {
         let params = ScanParams {
             paths: vec![PathBuf::from("/tmp")],
-            quarantine: true,
+            quarantine: Some(true),
             kind: "quick".into(),
         };
         let value = serde_json::to_value(&params).unwrap();
         let back: ScanParams = serde_json::from_value(value).unwrap();
-        assert!(back.quarantine);
+        assert_eq!(back.quarantine, Some(true));
         assert_eq!(back.paths.len(), 1);
         assert_eq!(back.kind, "quick");
     }
@@ -309,5 +320,25 @@ mod tests {
         let value = serde_json::json!({ "paths": ["/tmp"], "quarantine": false });
         let params: ScanParams = serde_json::from_value(value).unwrap();
         assert_eq!(params.kind, "custom");
+        assert_eq!(params.quarantine, Some(false));
+    }
+
+    #[test]
+    fn scan_params_quarantine_defaults_to_none() {
+        let value = serde_json::json!({ "paths": ["/tmp"] });
+        let params: ScanParams = serde_json::from_value(value).unwrap();
+        assert_eq!(params.quarantine, None);
+    }
+
+    #[test]
+    fn roundtrip_settings_set_params() {
+        let mut settings = Settings::default();
+        settings.realtime.enabled = false;
+        let params = SettingsSetParams {
+            settings: settings.clone(),
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        let back: SettingsSetParams = serde_json::from_value(value).unwrap();
+        assert_eq!(back.settings, settings);
     }
 }

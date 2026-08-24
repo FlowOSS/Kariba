@@ -1,9 +1,10 @@
+use kariba_core::config::Settings;
 use kariba_ipc::client::{reader, respond};
 use kariba_ipc::protocol::{
-    IdParams, QuarantineItem, RpcError, ScanHistoryItem, ScanParams, StatusResult, WireMessage,
-    error_code, method, parse_line,
+    IdParams, QuarantineItem, RpcError, ScanHistoryItem, ScanParams, SettingsSetParams,
+    StatusResult, WireMessage, error_code, method, parse_line,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -22,15 +23,19 @@ pub struct Daemon {
     db: Mutex<Db>,
     quarantine: Quarantine,
     active_scans: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    settings: Mutex<Settings>,
+    config_path: PathBuf,
 }
 
 impl Daemon {
-    pub fn new(db: Db, quarantine: Quarantine) -> Self {
+    pub fn new(db: Db, quarantine: Quarantine, settings: Settings, config_path: PathBuf) -> Self {
         Self {
             started_at: Instant::now(),
             db: Mutex::new(db),
             quarantine,
             active_scans: Mutex::new(HashMap::new()),
+            settings: Mutex::new(settings),
+            config_path,
         }
     }
 }
@@ -66,12 +71,14 @@ fn dispatch(
         method::STATUS => {
             let db = lock_db(daemon)?;
             let (scans_total, threats_total, quarantined_items) = db.counts();
+            let protection_enabled = lock_settings(daemon)?.realtime.enabled;
             serde_json::to_value(StatusResult {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 uptime_secs: daemon.started_at.elapsed().as_secs(),
                 scans_total,
                 threats_total,
                 quarantined_items,
+                protection_enabled,
             })
             .map_err(server_err)
         }
@@ -93,8 +100,18 @@ fn dispatch(
                 }
             }
             let cancel = Arc::new(AtomicBool::new(false));
+            let policy = {
+                let settings = lock_settings(daemon)?;
+                scanner::ScanPolicy {
+                    auto_quarantine: params
+                        .quarantine
+                        .unwrap_or(settings.scan.default_quarantine),
+                    exclusions: scanner::Exclusions::from_settings(&settings),
+                }
+            };
             let result = scanner::run_scan(
                 params,
+                &policy,
                 stream,
                 &daemon.db,
                 &daemon.quarantine,
@@ -191,6 +208,23 @@ fn dispatch(
             Ok(serde_json::Value::Bool(true))
         }
 
+        method::SETTINGS_GET => {
+            let settings = lock_settings(daemon)?.clone();
+            serde_json::to_value(settings).map_err(server_err)
+        }
+
+        method::SETTINGS_SET => {
+            let params: SettingsSetParams =
+                serde_json::from_value(params).map_err(|e| invalid_params(e.to_string()))?;
+            let mut settings = params.settings;
+            normalize_settings(&mut settings)?;
+            settings.save(&daemon.config_path).map_err(|e| {
+                RpcError::new(error_code::SERVER_ERROR, format!("cannot save config: {e}"))
+            })?;
+            *lock_settings(daemon)? = settings.clone();
+            serde_json::to_value(settings).map_err(server_err)
+        }
+
         _ => Err(RpcError::new(
             error_code::METHOD_NOT_FOUND,
             format!("unknown method: {method}"),
@@ -198,11 +232,65 @@ fn dispatch(
     }
 }
 
+// Whole-document sets come straight from clients, so trim, dedupe, and
+// reject shapes the scanner cannot apply. Persistence happens after
+// validation, so a rejected set never touches the config file.
+fn normalize_settings(settings: &mut Settings) -> Result<(), RpcError> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for raw in settings.exclusions.paths.drain(..) {
+        let path = raw.trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        if !(path.starts_with('/') || path.starts_with("~/")) {
+            return Err(invalid_params(format!(
+                "exclusion path must be absolute or start with ~/: {path}"
+            )));
+        }
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    settings.exclusions.paths = paths;
+
+    let mut seen_ext = HashSet::new();
+    let mut extensions = Vec::new();
+    for raw in settings.exclusions.extensions.drain(..) {
+        let ext = raw
+            .trim()
+            .trim_start_matches('*')
+            .trim_start_matches('.')
+            .to_lowercase();
+        if ext.is_empty() {
+            continue;
+        }
+        if ext.contains('/') {
+            return Err(invalid_params(format!(
+                "extension pattern must look like *.iso: {raw}"
+            )));
+        }
+        if seen_ext.insert(ext.clone()) {
+            extensions.push(format!("*.{ext}"));
+        }
+    }
+    settings.exclusions.extensions = extensions;
+
+    Ok(())
+}
+
 fn lock_db(daemon: &Daemon) -> Result<std::sync::MutexGuard<'_, Db>, RpcError> {
     daemon
         .db
         .lock()
         .map_err(|_| RpcError::new(error_code::SERVER_ERROR, "database lock poisoned"))
+}
+
+fn lock_settings(daemon: &Daemon) -> Result<std::sync::MutexGuard<'_, Settings>, RpcError> {
+    daemon
+        .settings
+        .lock()
+        .map_err(|_| RpcError::new(error_code::SERVER_ERROR, "settings lock poisoned"))
 }
 
 fn lock_active(

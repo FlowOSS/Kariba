@@ -1,3 +1,5 @@
+use kariba_core::config::Settings;
+use kariba_core::paths;
 use kariba_engine_clamav::{ClamdClient, ScanOutcome};
 use kariba_ipc::client::send;
 use kariba_ipc::protocol::{
@@ -16,34 +18,80 @@ use crate::quarantine::{Quarantine, sha256_file};
 
 const PROGRESS_EVERY: u64 = 100;
 const ENGINE: &str = "ClamAV";
-const EXCLUDED_PREFIXES: [&str; 4] = ["/proc", "/sys", "/dev", "/run"];
 
-fn is_excluded(path: &Path) -> bool {
-    EXCLUDED_PREFIXES
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
+// Policy resolved from Settings when a scan starts: whether detections are
+// quarantined and which paths/file types are skipped.
+pub struct ScanPolicy {
+    pub auto_quarantine: bool,
+    pub exclusions: Exclusions,
+}
+
+// User-configurable scan exclusions, snapshotted from Settings when a scan
+// starts. Path entries act as prefixes; extension entries are `*.ext`
+// patterns matched case-insensitively against the file extension.
+pub struct Exclusions {
+    prefixes: Vec<PathBuf>,
+    extensions: Vec<String>,
+}
+
+impl Exclusions {
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            prefixes: settings
+                .exclusions
+                .paths
+                .iter()
+                .map(|p| paths::expand_tilde(Path::new(p.trim())))
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect(),
+            extensions: settings
+                .exclusions
+                .extensions
+                .iter()
+                .filter_map(|e| e.trim().strip_prefix("*."))
+                .map(str::to_lowercase)
+                .collect(),
+        }
+    }
+
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        if self.prefixes.iter().any(|prefix| path.starts_with(prefix)) {
+            return true;
+        }
+        if self.extensions.is_empty() {
+            return false;
+        }
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| self.extensions.contains(&ext.to_lowercase()))
+    }
 }
 
 // Depth-first walk that yields only scannable regular files, applying the
 // same exclusion rules everywhere so the pre-count pass and the scan pass
 // agree on what will be scanned.
-struct FileWalker {
+struct FileWalker<'a> {
     stack: Vec<PathBuf>,
     skip: PathBuf,
+    exclusions: &'a Exclusions,
 }
 
-impl FileWalker {
-    fn new(roots: Vec<PathBuf>, skip: PathBuf) -> Self {
-        Self { stack: roots, skip }
+impl<'a> FileWalker<'a> {
+    fn new(roots: Vec<PathBuf>, skip: PathBuf, exclusions: &'a Exclusions) -> Self {
+        Self {
+            stack: roots,
+            skip,
+            exclusions,
+        }
     }
 }
 
-impl Iterator for FileWalker {
+impl Iterator for FileWalker<'_> {
     type Item = PathBuf;
 
     fn next(&mut self) -> Option<PathBuf> {
         while let Some(entry) = self.stack.pop() {
-            if entry.starts_with(&self.skip) || is_excluded(&entry) {
+            if entry.starts_with(&self.skip) || self.exclusions.is_excluded(&entry) {
                 continue;
             }
             let Ok(metadata) = entry.symlink_metadata() else {
@@ -77,6 +125,7 @@ fn lock_db(db: &Mutex<Db>) -> Result<MutexGuard<'_, Db>, RpcError> {
 
 pub fn run_scan(
     params: ScanParams,
+    policy: &ScanPolicy,
     writer: &mut UnixStream,
     db: &Mutex<Db>,
     quarantine: &Quarantine,
@@ -109,7 +158,8 @@ pub fn run_scan(
     }
 
     // Fast enumeration pass so clients can render determinate progress.
-    let files_total = FileWalker::new(params.paths.clone(), skip.clone()).count() as u64;
+    let files_total =
+        FileWalker::new(params.paths.clone(), skip.clone(), &policy.exclusions).count() as u64;
     if !send_progress(writer, scan_id, 0, files_total, 0, "") {
         cancel.store(true, Ordering::Relaxed);
     }
@@ -119,7 +169,7 @@ pub fn run_scan(
     let mut quarantined: u32 = 0;
     let mut cancelled = cancel.load(Ordering::Relaxed);
 
-    for entry in FileWalker::new(params.paths.clone(), skip) {
+    for entry in FileWalker::new(params.paths.clone(), skip, &policy.exclusions) {
         if cancelled {
             break;
         }
@@ -154,7 +204,7 @@ pub fn run_scan(
                     &signature,
                 );
 
-                if params.quarantine {
+                if policy.auto_quarantine {
                     match quarantine.put(threat_id, &entry) {
                         Ok(q) => {
                             let mut db = lock_db(db)?;

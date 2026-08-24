@@ -3,6 +3,7 @@ mod quarantine;
 mod scanner;
 mod server;
 
+use kariba_core::config::Settings;
 use kariba_core::paths;
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
@@ -12,6 +13,18 @@ fn main() {
     if socket.exists() {
         let _ = std::fs::remove_file(&socket);
     }
+
+    let config_path = paths::config_path();
+    let (settings, created) = match Settings::load_or_create(&config_path) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!(
+                "karibad: cannot load config at {} ({e}); using in-memory defaults",
+                config_path.display()
+            );
+            (Settings::default(), false)
+        }
+    };
 
     let db = match db::Db::open(&paths::db_path()) {
         Ok(db) => db,
@@ -29,7 +42,12 @@ fn main() {
         }
     };
 
-    let daemon = Arc::new(server::Daemon::new(db, quarantine));
+    let daemon = Arc::new(server::Daemon::new(
+        db,
+        quarantine,
+        settings,
+        config_path.clone(),
+    ));
 
     let listener = match UnixListener::bind(&socket) {
         Ok(listener) => listener,
@@ -43,6 +61,15 @@ fn main() {
         "karibad {} listening on {}",
         env!("CARGO_PKG_VERSION"),
         socket.display()
+    );
+    println!(
+        "  config: {}{}",
+        config_path.display(),
+        if created {
+            " (created with defaults)"
+        } else {
+            ""
+        }
     );
     println!("  data dir: {}", paths::data_dir().display());
 

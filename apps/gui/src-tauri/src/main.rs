@@ -2,7 +2,8 @@
 
 use kariba_core::paths;
 use kariba_ipc::protocol::{
-    IdParams, QuarantineItem, ScanHistoryItem, ScanParams, ScanResult, StatusResult, method,
+    IdParams, QuarantineItem, ScanHistoryItem, ScanParams, ScanResult, Settings, SettingsSetParams,
+    StatusResult, method,
 };
 use kariba_ipc::{Client, Notification};
 use serde_json::Value;
@@ -73,6 +74,28 @@ async fn quarantine_delete(id: u64) -> Result<bool, String> {
 }
 
 #[tauri::command]
+async fn settings_get() -> Result<Settings, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let value = call(method::SETTINGS_GET, Value::Null)?;
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn settings_set(settings: Settings) -> Result<Settings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let params =
+            serde_json::to_value(SettingsSetParams { settings }).map_err(|e| e.to_string())?;
+        let value = call(method::SETTINGS_SET, params)?;
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn scan(
     app: tauri::AppHandle,
     paths: Vec<String>,
@@ -86,7 +109,7 @@ async fn scan(
                 .into_iter()
                 .map(|p| kariba_core::paths::expand_tilde(std::path::Path::new(&p)))
                 .collect(),
-            quarantine,
+            quarantine: Some(quarantine),
             kind,
         };
         let params = serde_json::to_value(params).map_err(|e| e.to_string())?;
@@ -167,7 +190,9 @@ fn main() {
             scan_history,
             quarantine_list,
             quarantine_restore,
-            quarantine_delete
+            quarantine_delete,
+            settings_get,
+            settings_set
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kariba");
