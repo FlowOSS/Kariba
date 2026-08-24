@@ -29,6 +29,15 @@ export interface StatusResult {
   threats_total: number;
   quarantined_items: number;
   protection_enabled: boolean;
+  realtime_active: boolean;
+  realtime_detail: string;
+}
+
+export interface RealtimeDetection {
+  path: string;
+  engine: string;
+  signature: string;
+  action: string;
 }
 
 export interface RealtimeSettings {

@@ -7,9 +7,14 @@
   import Survey from "./components/Survey.svelte";
   import SettingsView from "./components/Settings.svelte";
   import type { View } from "./lib/types";
+  import { startRealtimeEvents } from "./lib/api";
 
   let view = $state<View>("dashboard");
   let scanPreset = $state<string[]>([]);
+
+  $effect(() => {
+    startRealtimeEvents().catch(() => {});
+  });
 
   function quickScan(paths: string[]) {
     scanPreset = paths;

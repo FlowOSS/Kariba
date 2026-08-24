@@ -9,6 +9,7 @@ import type {
   StatusResult,
   SurveyReport,
   Settings,
+  RealtimeDetection,
 } from "./types";
 
 export function daemonStatus(): Promise<StatusResult> {
@@ -61,4 +62,12 @@ export function onScanProgress(cb: (p: ScanProgress) => void): Promise<UnlistenF
 
 export function onScanDetection(cb: (d: Detection) => void): Promise<UnlistenFn> {
   return listen<Detection>("kariba://scan-detection", (event) => cb(event.payload));
+}
+
+export function startRealtimeEvents(): Promise<void> {
+  return invoke<void>("realtime_events");
+}
+
+export function onRealtimeDetection(cb: (d: RealtimeDetection) => void): Promise<UnlistenFn> {
+  return listen<RealtimeDetection>("kariba://realtime-detection", (event) => cb(event.payload));
 }

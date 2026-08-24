@@ -83,6 +83,30 @@ async fn settings_get() -> Result<Settings, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// Persistent subscription: holds one daemon connection open and forwards
+/// every daemon-originated notification (real-time detections) as a Tauri
+/// event. Reconnects with backoff if the daemon restarts.
+#[tauri::command]
+async fn realtime_events(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        loop {
+            let socket = paths::socket_path();
+            if let Ok(mut client) = Client::connect(&socket) {
+                let _ = client.subscribe(|notification| {
+                    let event = match notification.method.as_str() {
+                        method::REALTIME_DETECTION => "kariba://realtime-detection",
+                        _ => return,
+                    };
+                    let _ = app.emit(event, &notification.params);
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn settings_set(settings: Settings) -> Result<Settings, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -192,7 +216,8 @@ fn main() {
             quarantine_restore,
             quarantine_delete,
             settings_get,
-            settings_set
+            settings_set,
+            realtime_events
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kariba");
