@@ -481,26 +481,83 @@ $ kariba update && kariba scan --full
 
 #### Settings
 
+Implemented 2026-08-24. Users must always be able to see and change what
+Kariba does — including turning protection off — so the settings layer was
+built before real-time protection lands. The real-time master toggle ships
+now and persists intent; the fanotify slice reads it.
+
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  ◈ KARIBA · SETTINGS                                                         │
-├───────────────┬──────────────────────────────────────────────────────────────┤
-│ ▸ Protection  │  REAL-TIME PROTECTION                                        │
-│   Scanning    │                                                              │
-│   Quarantine  │    Scan files on write/close          [ON ]                  │
-│   Network     │    Block execution of threats         [ON ]                  │
-│   Audit       │    Auto-quarantine detections         [ON ]                  │
-│   Schedule    │                                                              │
-│   Appearance  │  MONITORED PATHS                                             │
-│   Advanced    │    ~/Downloads                              ✕                │
-│               │    /tmp                                     ✕                │
-│               │    /media/*                                 ✕                │
-│               │                                [ + Add path ]                │
-│               │                                                              │
-│               │  EXCLUSIONS                                                  │
-│               │    *.iso, *.img  ·  /var/lib/libvirt  …   [ Manage… ]        │
-└───────────────┴──────────────────────────────────────────────────────────────┘
+├────────────────┬─────────────────────────────────────────────────────────────┤
+│  Dashboard     │  PROTECTION                                                 │
+│  Scan          │                                                             │
+│  Quarantine    │   Real-time protection                       [ON ]          │
+│  Survey        │   Watch files as they land and gate execution of threats.   │
+│                │   Takes effect once real-time scanning is active.           │
+│  ──────────    │                                                             │
+│ ▸ Settings     │   Auto-quarantine detections                 [ON ]          │
+│                │   Move threats to quarantine automatically on detection.    │
+│                │                                                             │
+│                │  SCANNING                                                   │
+│                │                                                             │
+│                │   Quarantine threats by default              [ON ]          │
+│                │   Applies to scans started without an explicit choice.      │
+│                │                                                             │
+│                │  EXCLUSIONS                                                 │
+│                │                                                             │
+│                │   Paths never scanned:                       [ + Add path ] │
+│                │     /proc            ◆ built-in                  ✕          │
+│                │     /sys             ◆ built-in                  ✕          │
+│                │     /dev             ◆ built-in                  ✕          │
+│                │     /run             ◆ built-in                  ✕          │
+│                │     /home/stikyt/vms                             ✕          │
+│                │                                                             │
+│                │   File types skipped:                   [ + Add pattern ]   │
+│                │     *.iso  ✕     *.img  ✕                                   │
+└────────────────┴─────────────────────────────────────────────────────────────┘
 ```
+
+Interactions (all implemented):
+
+- Toggling real-time protection **off** shows a one-click confirm dialog
+  ("Turn off protection?" → Cancel / Turn off). Friction, not lockout —
+  the user's machine, the user's call.
+- Built-in exclusions (`/proc`, `/sys`, `/dev`, `/run`) are badged ◆ and
+  user-removable, but removal shows a scary warning explaining the
+  consequence per path (kernel pseudo-files can stall the scan engine,
+  device nodes can hang reads).
+- When ≥1 built-in is missing, a persistent warning banner appears with a
+  **Restore built-ins** button that re-adds only the missing ones.
+- The quarantine directory itself is always skipped structurally (not a
+  setting — scanning quarantined blobs would re-detect them).
+- Dashboard shows "Protection off / Settings ▸ to re-enable" when disabled.
+
+**Config schema** — TOML, owned by the daemon, at `/etc/kariba/kariba.toml`
+(root) or `~/.config/kariba/kariba.toml` (unprivileged dev mode). Created
+with defaults on first daemon start; `settings.set` validates, persists
+atomically (tmp + rename), then applies. Missing keys fall back to
+defaults, so hand-edited partial files work.
+
+```toml
+[realtime]
+enabled = true            # master switch; fanotify slice reads this
+auto_quarantine = true
+
+[scan]
+default_quarantine = true # applies when a client sends no explicit choice
+
+[exclusions]
+paths = ["/proc", "/sys", "/dev", "/run"]   # prefix match
+extensions = []                              # "*.iso" patterns, case-insensitive
+```
+
+**RPC** — `settings.get` returns the whole document; `settings.set` accepts
+the whole document (read-modify-write clients; no partial-update semantics).
+Validation: exclusion paths must be absolute or `~/…`; extension patterns
+normalize to `*.ext`. `status` carries `protection_enabled` so any client
+can show protection state. CLI parity: `kariba-cli settings`,
+`settings set <key> <value>` (dotted keys), `settings restore-builtins`.
 
 #### System Tray
 
@@ -664,9 +721,16 @@ names free; no conflicting security product; GitHub org handled by
 7. `kariba-cli status|survey|scan|quarantine` + EICAR end-to-end proof ✓
    (EICAR detected ~20ms → quarantined mode 000 → restored byte-identical →
    deleted; verified 2026-08-23 on Artix dev machine)
-8. Packaging: systemd unit `[ASSUMPTION]` + OpenRC script
-9. GUI: Tauri 2 scaffold, dashboard + scan view wired to the daemon
-10. Push to `FlowOSS/kariba`, alpha release for community feedback
+8. ~~GUI~~ ✓ — Tauri 2 + Svelte 5: dashboard, scan (cancel + history),
+   quarantine, survey, settings; frameless window, NVIDIA+Wayland workaround
+9. ~~Settings layer~~ ✓ (2026-08-24) — daemon-owned TOML config,
+   `settings.get`/`settings.set` RPC, GUI settings page with protection
+   toggles + exclusion manager, CLI parity. Real-time master toggle ships
+   ahead of the fanotify slice so users can opt out before it exists.
+10. Real-time protection — fanotify watcher on `~/Downloads` + `/tmp`,
+    gated by `realtime.enabled`
+11. Packaging: systemd unit `[ASSUMPTION]` + OpenRC script
+12. Push to `FlowOSS/kariba`, alpha release for community feedback
 
 ## Assumptions to Verify
 
