@@ -1825,6 +1825,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "tempfile",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -1850,6 +1851,7 @@ dependencies = [
 name = "kariba-ipc"
 version = "0.1.0"
 dependencies = [
+ "kariba-core",
  "serde",
  "serde_json",
 ]

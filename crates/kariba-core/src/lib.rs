@@ -1,4 +1,5 @@
 pub mod clamav;
+pub mod config;
 pub mod distro;
 pub mod init;
 pub mod paths;

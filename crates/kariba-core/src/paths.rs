@@ -46,6 +46,23 @@ pub fn quarantine_dir() -> PathBuf {
     data_dir().join("quarantine")
 }
 
+pub fn config_dir() -> PathBuf {
+    let system = PathBuf::from("/etc/kariba");
+    if fs::create_dir_all(&system).is_ok() {
+        return system;
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg).join("kariba");
+    }
+    home()
+        .map(|h| h.join(".config/kariba"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/kariba-config"))
+}
+
+pub fn config_path() -> PathBuf {
+    config_dir().join("kariba.toml")
+}
+
 pub fn expand_tilde(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if raw == "~" {
@@ -82,6 +99,7 @@ mod tests {
         assert_eq!(socket_path().file_name().unwrap(), "karibad.sock");
         assert_eq!(db_path().file_name().unwrap(), "kariba.db");
         assert_eq!(quarantine_dir().file_name().unwrap(), "quarantine");
+        assert_eq!(config_path().file_name().unwrap(), "kariba.toml");
     }
 
     #[test]
