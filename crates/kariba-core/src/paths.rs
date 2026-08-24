@@ -49,6 +49,24 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("karibad.sock")
 }
 
+/// Sockets a client should try in order. The daemon binds `socket_path()`
+/// (euid selection), but a client may need a daemon of the other privilege
+/// level — the unprivileged GUI talking to a root daemon is the normal case
+/// for real-time protection until polkit lands. The euid path stays first,
+/// so a same-user daemon always wins when both run side by side.
+pub fn socket_candidates() -> Vec<PathBuf> {
+    let primary = socket_path();
+    if running_as_root() {
+        return vec![primary];
+    }
+    let system = PathBuf::from("/run/kariba/karibad.sock");
+    if primary == system {
+        vec![primary]
+    } else {
+        vec![primary, system]
+    }
+}
+
 pub fn db_path() -> PathBuf {
     data_dir().join("kariba.db")
 }
@@ -113,6 +131,12 @@ mod tests {
         assert_eq!(db_path().file_name().unwrap(), "kariba.db");
         assert_eq!(quarantine_dir().file_name().unwrap(), "quarantine");
         assert_eq!(config_path().file_name().unwrap(), "kariba.toml");
+    }
+
+    #[test]
+    fn socket_candidates_include_primary_first() {
+        let candidates = socket_candidates();
+        assert_eq!(candidates[0], socket_path());
     }
 
     #[test]

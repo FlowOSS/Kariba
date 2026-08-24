@@ -300,11 +300,14 @@ detection (threat records), keeping the hot path at stat + hashmap lookup.
 
 **Privilege & degradation.** `FAN_CLASS_CONTENT` requires CAP_SYS_ADMIN: a
 non-root dev daemon reports `realtime_active = false` with the reason and
-never crashes. Root-mode testing uses `sudo ./target/debug/karibad` + CLI;
-the GUI↔root-daemon privilege story is polkit work in the packaging phase.
-If karibad dies, the kernel auto-allows pending permission events
-(fail-open is kernel behavior, not a choice) — service supervision with
-restart-on-crash is the mitigation.
+never crashes. Root-mode testing uses `sudo ./target/debug/karibad` + CLI.
+Interim GUI↔root-daemon access (until polkit lands with packaging): the
+root daemon chmods its socket 0666 (clamd model) and unprivileged clients
+fall back to `/run/kariba/karibad.sock` after trying their own, so the
+user GUI reaches the root daemon — any local user can talk to karibad in
+the meantime. If karibad dies, the kernel auto-allows pending permission
+events (fail-open is kernel behavior, not a choice) — service supervision
+with restart-on-crash is the mitigation.
 
 **Engine I/O — INSTREAM, not paths.** karibad streams file *contents* to
 clamd (`zINSTREAM`) instead of sending paths: the daemon runs as root and
@@ -318,6 +321,15 @@ SCAN's newline-terminated replies.
 **Known race.** Between close-write and its async verdict, a non-exec read
 can touch a fresh file. Accepted: the exec gate closes the dangerous path
 (files that merely get read can't run code), matching the minifilter model.
+
+**Why our own watcher instead of ClamAV's `clamonacc`.** ClamAV ships an
+optional on-access scanner (`clamonacc`, also fanotify-based), but it is a
+separate process configured inside `clamd.conf` that only detects and logs —
+no quarantine, no policy layer, no client feed. Building the fanotify
+watcher inside karibad lets real-time protection obey Kariba settings
+(master toggle, exclusions, auto-quarantine), act on detections (deny exec,
+quarantine with mode 000), and broadcast verdicts to CLI/GUI over the
+existing IPC.
 
 ## Features
 
@@ -762,6 +774,11 @@ Exposed during GUI testing (2026-08-23) — fix before alpha:
 1. **Sequential scan throughput** — ~60 files/s on `/usr` (single clamd
    connection, one round-trip per file). Phase 3 parallel scanning (worker
    pool + multiple clamd connections or `INSTREAM` batching) addresses this.
+2. **Real-time detections placement** — live detections render inside the
+   Dashboard system-status area, which works but looks ugly. They need a
+   dedicated place (activity feed / own section) plus proper desktop
+   notifications (detection while the GUI is closed is currently silent).
+   Feeds into the still-missing system tray + notification story.
 
 Resolved (2026-08-23): DB lock held for whole scan (scanner now takes
 short-lived locks per DB operation; GUI commands are async, so status /

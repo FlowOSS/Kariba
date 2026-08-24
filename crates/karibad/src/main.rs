@@ -9,6 +9,7 @@ mod server;
 
 use kariba_core::config::Settings;
 use kariba_core::paths;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
@@ -61,6 +62,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Unprivileged clients (CLI/GUI) must be able to reach a root daemon —
+    // same model as clamd's 0666 socket. polkit gates this in the packaging
+    // phase; until then any local user can talk to karibad.
+    let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666));
 
     println!(
         "karibad {} listening on {}",

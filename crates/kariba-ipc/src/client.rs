@@ -23,7 +23,6 @@ impl Client {
             next_id: 1,
         })
     }
-
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
         let mut ignore = |_: &Notification| {};
         self.call_with_notifications(method, params, &mut ignore)
@@ -91,6 +90,21 @@ impl Client {
             }
         }
     }
+}
+
+/// Connect to the daemon, trying the socket candidates in order
+/// (same-user daemon first, then the root daemon's well-known socket).
+pub fn connect_daemon() -> std::io::Result<Client> {
+    let mut last = None;
+    for path in kariba_core::paths::socket_candidates() {
+        match Client::connect(&path) {
+            Ok(client) => return Ok(client),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no socket candidates")
+    }))
 }
 
 pub fn send<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<(), RpcError> {
