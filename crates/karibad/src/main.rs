@@ -1,5 +1,9 @@
+mod broadcast;
 mod db;
+mod exclusions;
+mod fanotify;
 mod quarantine;
+mod realtime;
 mod scanner;
 mod server;
 
@@ -48,6 +52,7 @@ fn main() {
         settings,
         config_path.clone(),
     ));
+    daemon.sync_realtime();
 
     let listener = match UnixListener::bind(&socket) {
         Ok(listener) => listener,
@@ -72,6 +77,15 @@ fn main() {
         }
     );
     println!("  data dir: {}", paths::data_dir().display());
+    let (realtime_active, realtime_detail) = daemon.realtime_status();
+    println!(
+        "  real-time: {} ({realtime_detail})",
+        if realtime_active {
+            "active"
+        } else {
+            "inactive"
+        }
+    );
 
     for stream in listener.incoming().flatten() {
         let daemon = Arc::clone(&daemon);

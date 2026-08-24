@@ -1833,6 +1833,7 @@ name = "kariba-engine-clamav"
 version = "0.1.0"
 dependencies = [
  "kariba-core",
+ "tempfile",
 ]
 
 [[package]]
@@ -1873,6 +1874,7 @@ dependencies = [
  "kariba-engine-clamav",
  "kariba-ipc",
  "kariba-survey",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

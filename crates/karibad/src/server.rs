@@ -1,4 +1,5 @@
 use kariba_core::config::Settings;
+use kariba_core::paths;
 use kariba_ipc::client::{reader, respond};
 use kariba_ipc::protocol::{
     IdParams, QuarantineItem, RpcError, ScanHistoryItem, ScanParams, SettingsSetParams,
@@ -12,40 +13,117 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::broadcast::Broadcaster;
 use crate::db::Db;
 use crate::quarantine::Quarantine;
+use crate::realtime;
 use crate::scanner;
 
 const HISTORY_LIMIT: u64 = 20;
 
 pub struct Daemon {
     started_at: Instant,
-    db: Mutex<Db>,
-    quarantine: Quarantine,
+    db: Arc<Mutex<Db>>,
+    quarantine: Arc<Quarantine>,
     active_scans: Mutex<HashMap<u64, Arc<AtomicBool>>>,
-    settings: Mutex<Settings>,
+    settings: Arc<Mutex<Settings>>,
     config_path: PathBuf,
+    broadcaster: Arc<Broadcaster>,
+    realtime: Mutex<Option<realtime::Handle>>,
+    realtime_detail: Mutex<String>,
 }
 
 impl Daemon {
     pub fn new(db: Db, quarantine: Quarantine, settings: Settings, config_path: PathBuf) -> Self {
         Self {
             started_at: Instant::now(),
-            db: Mutex::new(db),
-            quarantine,
+            db: Arc::new(Mutex::new(db)),
+            quarantine: Arc::new(quarantine),
             active_scans: Mutex::new(HashMap::new()),
-            settings: Mutex::new(settings),
+            settings: Arc::new(Mutex::new(settings)),
             config_path,
+            broadcaster: Arc::new(Broadcaster::new()),
+            realtime: Mutex::new(None),
+            realtime_detail: Mutex::new("not started".into()),
         }
+    }
+
+    /// Align the watcher with `realtime.enabled`. Called at startup and
+    /// after every settings change (a restart re-snapshots exclusions and
+    /// the auto-quarantine flag). Safe to call repeatedly.
+    pub fn sync_realtime(&self) {
+        let enabled = self
+            .settings
+            .lock()
+            .map(|s| s.realtime.enabled)
+            .unwrap_or(false);
+        let Ok(mut slot) = self.realtime.lock() else {
+            return;
+        };
+        let Ok(mut detail) = self.realtime_detail.lock() else {
+            return;
+        };
+
+        if let Some(handle) = slot.take() {
+            handle.stop();
+        }
+
+        if !enabled {
+            *detail = "disabled in settings".into();
+            return;
+        }
+
+        let Ok(settings) = self.settings.lock() else {
+            return;
+        };
+        let ctx = realtime::WatcherCtx {
+            db: Arc::clone(&self.db),
+            quarantine: Arc::clone(&self.quarantine),
+            broadcaster: Arc::clone(&self.broadcaster),
+            data_dir: paths::data_dir(),
+            settings: settings.clone(),
+        };
+        drop(settings);
+        match realtime::start(ctx) {
+            Ok(handle) => {
+                let mount_list = handle
+                    .mounts
+                    .iter()
+                    .map(|m| m.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                *detail = format!("watching {} mount(s): {}", handle.mounts.len(), mount_list);
+                *slot = Some(handle);
+            }
+            Err(reason) => *detail = reason,
+        }
+    }
+
+    pub fn realtime_status(&self) -> (bool, String) {
+        let active = self
+            .realtime
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false);
+        let detail = self
+            .realtime_detail
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_default();
+        (active, detail)
     }
 }
 
 pub fn handle_connection(mut stream: UnixStream, daemon: Arc<Daemon>) {
+    let subscription = daemon.broadcaster.register(&stream);
     let Ok(buf_reader) = reader(&stream) else {
+        if let Some(id) = subscription {
+            daemon.broadcaster.unregister(id);
+        }
         return;
     };
     for line in buf_reader.lines() {
-        let Ok(line) = line else { return };
+        let Ok(line) = line else { break };
         let message = match parse_line(&line) {
             Ok(message) => message,
             Err(_) => continue,
@@ -56,6 +134,9 @@ pub fn handle_connection(mut stream: UnixStream, daemon: Arc<Daemon>) {
 
         let result = dispatch(&daemon, &mut stream, &request.method, request.params);
         respond(&mut stream, request.id, result);
+    }
+    if let Some(id) = subscription {
+        daemon.broadcaster.unregister(id);
     }
 }
 
@@ -69,9 +150,9 @@ fn dispatch(
         method::PING => Ok(serde_json::Value::String("pong".into())),
 
         method::STATUS => {
-            let db = lock_db(daemon)?;
-            let (scans_total, threats_total, quarantined_items) = db.counts();
+            let (scans_total, threats_total, quarantined_items) = lock_db(daemon)?.counts();
             let protection_enabled = lock_settings(daemon)?.realtime.enabled;
+            let (realtime_active, realtime_detail) = daemon.realtime_status();
             serde_json::to_value(StatusResult {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 uptime_secs: daemon.started_at.elapsed().as_secs(),
@@ -79,6 +160,8 @@ fn dispatch(
                 threats_total,
                 quarantined_items,
                 protection_enabled,
+                realtime_active,
+                realtime_detail,
             })
             .map_err(server_err)
         }
@@ -106,7 +189,7 @@ fn dispatch(
                     auto_quarantine: params
                         .quarantine
                         .unwrap_or(settings.scan.default_quarantine),
-                    exclusions: scanner::Exclusions::from_settings(&settings),
+                    exclusions: crate::exclusions::Exclusions::from_settings(&settings),
                 }
             };
             let result = scanner::run_scan(
@@ -222,6 +305,9 @@ fn dispatch(
                 RpcError::new(error_code::SERVER_ERROR, format!("cannot save config: {e}"))
             })?;
             *lock_settings(daemon)? = settings.clone();
+            // Realign the watcher: picks up realtime.enabled, exclusions,
+            // and the auto-quarantine flag.
+            daemon.sync_realtime();
             serde_json::to_value(settings).map_err(server_err)
         }
 

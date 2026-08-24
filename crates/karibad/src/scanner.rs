@@ -1,5 +1,3 @@
-use kariba_core::config::Settings;
-use kariba_core::paths;
 use kariba_engine_clamav::{ClamdClient, ScanOutcome};
 use kariba_ipc::client::send;
 use kariba_ipc::protocol::{
@@ -8,12 +6,13 @@ use kariba_ipc::protocol::{
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::db::Db;
+use crate::exclusions::Exclusions;
 use crate::quarantine::{Quarantine, sha256_file};
 
 const PROGRESS_EVERY: u64 = 100;
@@ -24,47 +23,6 @@ const ENGINE: &str = "ClamAV";
 pub struct ScanPolicy {
     pub auto_quarantine: bool,
     pub exclusions: Exclusions,
-}
-
-// User-configurable scan exclusions, snapshotted from Settings when a scan
-// starts. Path entries act as prefixes; extension entries are `*.ext`
-// patterns matched case-insensitively against the file extension.
-pub struct Exclusions {
-    prefixes: Vec<PathBuf>,
-    extensions: Vec<String>,
-}
-
-impl Exclusions {
-    pub fn from_settings(settings: &Settings) -> Self {
-        Self {
-            prefixes: settings
-                .exclusions
-                .paths
-                .iter()
-                .map(|p| paths::expand_tilde(Path::new(p.trim())))
-                .filter(|p| !p.as_os_str().is_empty())
-                .collect(),
-            extensions: settings
-                .exclusions
-                .extensions
-                .iter()
-                .filter_map(|e| e.trim().strip_prefix("*."))
-                .map(str::to_lowercase)
-                .collect(),
-        }
-    }
-
-    pub fn is_excluded(&self, path: &Path) -> bool {
-        if self.prefixes.iter().any(|prefix| path.starts_with(prefix)) {
-            return true;
-        }
-        if self.extensions.is_empty() {
-            return false;
-        }
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| self.extensions.contains(&ext.to_lowercase()))
-    }
 }
 
 // Depth-first walk that yields only scannable regular files, applying the

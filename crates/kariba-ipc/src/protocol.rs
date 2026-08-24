@@ -21,6 +21,7 @@ pub mod method {
 
     pub const SCAN_PROGRESS: &str = "scan.progress";
     pub const SCAN_DETECTION: &str = "scan.detection";
+    pub const REALTIME_DETECTION: &str = "realtime.detection";
 }
 
 pub mod error_code {
@@ -231,6 +232,17 @@ pub struct StatusResult {
     pub threats_total: u64,
     pub quarantined_items: u64,
     pub protection_enabled: bool,
+    pub realtime_active: bool,
+    pub realtime_detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealtimeDetection {
+    pub path: String,
+    pub engine: String,
+    pub signature: String,
+    // "detected" | "quarantined" | "denied" | "denied+quarantined"
+    pub action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

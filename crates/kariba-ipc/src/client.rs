@@ -68,6 +68,29 @@ impl Client {
             }
         }
     }
+    /// Read notifications until the connection closes. Used by subscribers
+    /// that hold a connection open purely to receive daemon broadcasts.
+    pub fn subscribe<F>(&mut self, mut on_notify: F) -> Result<(), RpcError>
+    where
+        F: FnMut(&Notification),
+    {
+        loop {
+            let mut line = String::new();
+            let n = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| RpcError::new(error_code::SERVER_ERROR, e.to_string()))?;
+            if n == 0 {
+                return Err(RpcError::new(
+                    error_code::SERVER_ERROR,
+                    "connection closed by daemon",
+                ));
+            }
+            if let WireMessage::Notification(notification) = parse_line(line.trim_end())? {
+                on_notify(&notification);
+            }
+        }
+    }
 }
 
 pub fn send<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<(), RpcError> {
