@@ -99,6 +99,15 @@ fn main() {
                 }
             );
             println!(
+                "real-time: {} ({})",
+                if status.realtime_active {
+                    "active"
+                } else {
+                    "inactive"
+                },
+                status.realtime_detail
+            );
+            println!(
                 "scans: {} · threats: {} · quarantined: {}",
                 status.scans_total, status.threats_total, status.quarantined_items
             );
