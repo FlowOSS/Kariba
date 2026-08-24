@@ -7,3 +7,6 @@ repository.workspace = true
 
 [dependencies]
 kariba-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
