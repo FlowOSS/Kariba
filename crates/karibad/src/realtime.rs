@@ -397,12 +397,27 @@ impl Shared {
             queue.push_scan(path.to_path_buf());
             return true;
         }
+        let started = Instant::now();
         match scan_bounded(path) {
             Some(ScanOutcome::Clean) => {
+                // One line per cache-miss verdict: the moments the gate
+                // actually held an exec. Re-execs hit the cache and stay
+                // silent, so this doesn't spam on normal process churn.
+                eprintln!(
+                    "karibad: exec gate: checked {} (clean, {}ms)",
+                    path.display(),
+                    started.elapsed().as_millis()
+                );
                 self.cache_put(key, Verdict::Clean);
                 true
             }
             Some(ScanOutcome::Infected { signature }) => {
+                eprintln!(
+                    "karibad: exec gate: DENIED {} ({}, {}ms)",
+                    path.display(),
+                    signature,
+                    started.elapsed().as_millis()
+                );
                 self.cache_put(key, Verdict::Infected(signature.clone()));
                 queue.push_gate_detection(path.to_path_buf(), signature);
                 false
