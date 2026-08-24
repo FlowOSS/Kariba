@@ -22,10 +22,10 @@
   });
 
   const BUILTIN_REASONS: Record<string, string> = {
-    "/proc": "Kernel process pseudo-files — scanning them is pointless and can stall the scan engine.",
-    "/sys": "Kernel device/model pseudo-files — scanning them is pointless and can stall the scan engine.",
-    "/dev": "Device nodes — reading them can hang scans or have side effects.",
-    "/run": "Runtime sockets and ephemeral state — constantly changing, nothing to scan.",
+    "/proc": "Kernel process pseudo-files. Scanning them is pointless and can stall the engine.",
+    "/sys": "Kernel device pseudo-files. Scanning them is pointless and can stall the engine.",
+    "/dev": "Device nodes. Reading them can hang scans or have side effects.",
+    "/run": "Runtime sockets and ephemeral state. Constantly changing, nothing to scan.",
   };
 
   async function load() {
@@ -181,7 +181,7 @@
 
   {#if !daemonUp}
     <div class="card mb-6 border-danger/40 bg-danger/5 p-5 text-sm text-danger">
-      karibad is not running — start it to view or change settings.
+      karibad is not running. Start it to view or change settings.
     </div>
   {/if}
 

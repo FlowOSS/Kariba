@@ -33,7 +33,7 @@
     <div>
       <h1 class="text-xl font-semibold">Survey</h1>
       <p class="text-sm text-muted">
-        Dependency verification & guided setup — detects what's missing and how to fix it
+        Detects missing dependencies and shows how to fix them
       </p>
     </div>
     <button class="btn btn-ghost" onclick={run} disabled={loading}>

@@ -34,7 +34,7 @@
   };
 
   const TYPES: { id: ScanKind; name: string; desc: string; icon: typeof Zap }[] = [
-    { id: "quick", name: "Quick", desc: "Downloads, /tmp — fast", icon: Zap },
+    { id: "quick", name: "Quick", desc: "Downloads and /tmp", icon: Zap },
     { id: "full", name: "Full", desc: "Entire filesystem", icon: Globe },
     { id: "custom", name: "Custom", desc: "Choose your own paths", icon: FolderSearch },
   ];
@@ -178,7 +178,7 @@
 <div class="mx-auto max-w-5xl px-8 py-8">
   <div class="mb-6">
     <h1 class="text-xl font-semibold">Scan</h1>
-    <p class="text-sm text-muted">On-demand scanning via karibad → ClamAV</p>
+    <p class="text-sm text-muted">Scan your files on demand</p>
   </div>
 
   <div class="mb-6 grid grid-cols-3 gap-4">

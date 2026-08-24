@@ -69,7 +69,7 @@
     <div>
       <h1 class="text-xl font-semibold">Quarantine</h1>
       <p class="text-sm text-muted">
-        Isolated files · mode 000 · cannot execute
+        Threats are locked here until you decide what to do with them
       </p>
     </div>
     <button class="btn btn-ghost" onclick={load} disabled={loading}>
@@ -139,7 +139,7 @@
     <div class="mb-3 flex items-center gap-2">
       <History size={15} class="text-muted" />
       <h2 class="text-sm font-semibold">Detection history</h2>
-      <span class="text-xs text-muted">every verdict · duplicates kept · resolved items stay</span>
+      <span class="text-xs text-muted">Everything Kariba has flagged, and how it was resolved</span>
     </div>
     <div class="card overflow-hidden">
       {#if history.length === 0}

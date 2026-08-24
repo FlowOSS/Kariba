@@ -245,7 +245,7 @@
         {/each}
       </div>
     {:else}
-      <div class="text-sm text-muted">Survey unavailable — is karibad running?</div>
+      <div class="text-sm text-muted">Survey unavailable. Is karibad running?</div>
     {/if}
   </div>
 </div>
