@@ -11,9 +11,12 @@
   } from "@lucide/svelte";
   import * as api from "../lib/api";
   import { fmtRel } from "../lib/format";
-  import type { ScanHistoryItem, StatusResult, SurveyReport } from "../lib/types";
+  import type { ScanHistoryItem, StatusResult, SurveyReport, View } from "../lib/types";
 
-  let { onquickscan }: { onquickscan: (paths: string[]) => void } = $props();
+  let {
+    onquickscan,
+    onnavigate,
+  }: { onquickscan: (paths: string[]) => void; onnavigate: (v: View) => void } = $props();
 
   let status = $state<StatusResult | null>(null);
   let report = $state<SurveyReport | null>(null);
@@ -90,6 +93,19 @@
           <div>
             <div class="text-lg font-semibold">Offline</div>
             <div class="text-xs text-muted">daemon unreachable</div>
+          </div>
+        </div>
+      {:else if status && !status.protection_enabled}
+        <div class="flex items-center gap-3 text-warn">
+          <ShieldOff size={34} />
+          <div>
+            <div class="text-lg font-semibold">Protection off</div>
+            <button
+              class="cursor-pointer text-xs text-accent hover:underline"
+              onclick={() => onnavigate("settings")}
+            >
+              Settings ▸ to re-enable
+            </button>
           </div>
         </div>
       {:else if protected_}

@@ -42,6 +42,9 @@
   let kind = $state<ScanKind>("quick");
   let customPaths = $state("~/Downloads");
   let quarantine = $state(true);
+  api.settingsGet()
+    .then((s) => (quarantine = s.scan.default_quarantine))
+    .catch(() => {});
   let running = $state(false);
   let done = $state(false);
   let cancelled = $state(false);

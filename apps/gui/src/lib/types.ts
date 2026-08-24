@@ -28,7 +28,30 @@ export interface StatusResult {
   scans_total: number;
   threats_total: number;
   quarantined_items: number;
+  protection_enabled: boolean;
 }
+
+export interface RealtimeSettings {
+  enabled: boolean;
+  auto_quarantine: boolean;
+}
+
+export interface ScanSettings {
+  default_quarantine: boolean;
+}
+
+export interface ExclusionSettings {
+  paths: string[];
+  extensions: string[];
+}
+
+export interface Settings {
+  realtime: RealtimeSettings;
+  scan: ScanSettings;
+  exclusions: ExclusionSettings;
+}
+
+export const BUILTIN_EXCLUSION_PATHS = ["/proc", "/sys", "/dev", "/run"];
 
 export interface ScanProgress {
   scan_id: number;
@@ -74,4 +97,4 @@ export interface QuarantineItem {
   quarantined_at: number;
 }
 
-export type View = "dashboard" | "scan" | "quarantine" | "survey";
+export type View = "dashboard" | "scan" | "quarantine" | "survey" | "settings";

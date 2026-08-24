@@ -8,6 +8,7 @@ import type {
   Detection,
   StatusResult,
   SurveyReport,
+  Settings,
 } from "./types";
 
 export function daemonStatus(): Promise<StatusResult> {
@@ -44,6 +45,14 @@ export function quarantineRestore(id: number): Promise<string> {
 
 export function quarantineDelete(id: number): Promise<boolean> {
   return invoke<boolean>("quarantine_delete", { id });
+}
+
+export function settingsGet(): Promise<Settings> {
+  return invoke<Settings>("settings_get");
+}
+
+export function settingsSet(settings: Settings): Promise<Settings> {
+  return invoke<Settings>("settings_set", { settings });
 }
 
 export function onScanProgress(cb: (p: ScanProgress) => void): Promise<UnlistenFn> {

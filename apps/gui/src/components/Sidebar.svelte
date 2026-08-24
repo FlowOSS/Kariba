@@ -1,5 +1,12 @@
 <script lang="ts">
-  import { LayoutDashboard, ScanSearch, Archive, HeartPulse, Waves } from "@lucide/svelte";
+  import {
+    LayoutDashboard,
+    ScanSearch,
+    Archive,
+    HeartPulse,
+    Waves,
+    Settings,
+  } from "@lucide/svelte";
   import type { View } from "../lib/types";
   import { daemonStatus } from "../lib/api";
 
@@ -59,7 +66,21 @@
     {/each}
   </nav>
 
-  <div class="mt-auto px-5 py-4 text-xs text-muted">
+  <div class="mt-auto px-3 pb-1">
+    <div class="mx-2 mb-2 border-t border-edge"></div>
+    <button
+      class="flex w-full cursor-pointer items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors {view ===
+      'settings'
+        ? 'bg-surface-2 text-ink'
+        : 'text-muted hover:bg-surface-2/60 hover:text-ink'}"
+      onclick={() => onnavigate("settings")}
+    >
+      <Settings size={16} />
+      Settings
+    </button>
+  </div>
+
+  <div class="px-5 py-4 text-xs text-muted">
     <div class="flex items-center gap-2">
       <span
         class="h-2 w-2 rounded-full {daemonUp === null
