@@ -3,13 +3,14 @@ use kariba_core::config::Settings;
 use kariba_core::paths;
 use kariba_ipc::protocol::{
     IdParams, QuarantineItem, ScanParams, ScanProgress, ScanResult, SettingsSetParams,
-    StatusResult, method,
+    StatusResult, ThreatHistoryItem, ThreatStatusFilter, method,
 };
 use kariba_ipc::{Client, Notification};
 use kariba_survey::{CheckStatus, SurveyReport, run_survey};
 use serde_json::Value;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "kariba-cli", version, about = "Command-line client for Kariba")]
@@ -38,6 +39,12 @@ enum Command {
     },
     /// Manage quarantined files
     Quarantine(QuarantineArgs),
+    /// Show detection history (every verdict, including resolved quarantines)
+    Threats {
+        /// Filter by status: detected, quarantined, restored, deleted
+        #[arg(long)]
+        status: Option<String>,
+    },
     /// View or change daemon settings
     Settings(SettingsArgs),
 }
@@ -172,6 +179,13 @@ fn main() {
                 1
             }
         },
+        Command::Threats { status } => match run_threats(status) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
         Command::Settings(args) => match run_settings(args) {
             Ok(code) => code,
             Err(e) => {
@@ -187,14 +201,15 @@ fn with_daemon<F>(action: F) -> Result<i32, kariba_ipc::RpcError>
 where
     F: FnOnce(&mut Client) -> Result<i32, kariba_ipc::RpcError>,
 {
-    let socket = paths::socket_path();
-    let mut client = Client::connect(&socket).map_err(|e| {
+    let mut client = kariba_ipc::connect_daemon().map_err(|e| {
+        let tried = paths::socket_candidates()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         kariba_ipc::RpcError::new(
             -32000,
-            format!(
-                "cannot reach karibad at {} ({e}). Start it first: karibad",
-                socket.display()
-            ),
+            format!("cannot reach karibad (tried {tried}): {e}. Start it first: karibad"),
         )
     })?;
     action(&mut client)
@@ -264,6 +279,52 @@ fn run_quarantine(args: QuarantineArgs) -> Result<i32, kariba_ipc::RpcError> {
             println!("deleted quarantine item {id}");
             Ok(0)
         }),
+    }
+}
+
+fn run_threats(status: Option<String>) -> Result<i32, kariba_ipc::RpcError> {
+    with_daemon(|client| {
+        let filter = ThreatStatusFilter { status };
+        let value = client.call(
+            method::THREATS_LIST,
+            serde_json::to_value(filter).unwrap_or_default(),
+        )?;
+        let items: Vec<ThreatHistoryItem> = serde_json::from_value(value)
+            .map_err(|e| kariba_ipc::RpcError::new(-32000, e.to_string()))?;
+        if items.is_empty() {
+            println!("no detections recorded");
+            return Ok(0);
+        }
+        const HEADER: [&str; 5] = ["WHEN", "VERDICT", "ENGINE", "SIGNATURE", "PATH"];
+        println!(
+            "{:<10} {:<12} {:<12} {:<24} {}",
+            HEADER[0], HEADER[1], HEADER[2], HEADER[3], HEADER[4]
+        );
+        for item in items {
+            println!(
+                "{:<10} {:<12} {:<12} {:<24} {}",
+                ago(item.detected_at),
+                item.status,
+                item.engine,
+                item.signature,
+                item.path
+            );
+        }
+        Ok(0)
+    })
+}
+
+fn ago(unix: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let delta = now.saturating_sub(unix);
+    match delta {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86400),
     }
 }
 

@@ -1,20 +1,30 @@
 <script lang="ts">
-  import { Archive, RotateCcw, Trash2, RefreshCw } from "@lucide/svelte";
+  import { Archive, RotateCcw, Trash2, RefreshCw, History } from "@lucide/svelte";
   import * as api from "../lib/api";
-  import type { QuarantineItem } from "../lib/types";
+  import type { QuarantineItem, ThreatHistoryItem } from "../lib/types";
 
   let items = $state<QuarantineItem[]>([]);
+  let history = $state<ThreatHistoryItem[]>([]);
   let loading = $state(true);
   let message = $state<string | null>(null);
+
+  const VERDICT_STYLE: Record<string, string> = {
+    detected: "bg-danger/15 text-danger",
+    quarantined: "bg-warn/15 text-warn",
+    restored: "bg-accent/15 text-accent",
+    deleted: "bg-edge/60 text-muted",
+  };
 
   async function load() {
     loading = true;
     message = null;
     try {
       items = await api.quarantineList();
+      history = await api.threatsHistory();
     } catch (e) {
       message = String(e);
       items = [];
+      history = [];
     }
     loading = false;
   }
@@ -123,5 +133,53 @@
         </tbody>
       </table>
     {/if}
+  </div>
+
+  <div class="mt-8">
+    <div class="mb-3 flex items-center gap-2">
+      <History size={15} class="text-muted" />
+      <h2 class="text-sm font-semibold">Detection history</h2>
+      <span class="text-xs text-muted">every verdict · duplicates kept · resolved items stay</span>
+    </div>
+    <div class="card overflow-hidden">
+      {#if history.length === 0}
+        <div class="py-10 text-center text-sm text-muted">
+          {loading ? "Loading…" : "No detections recorded yet"}
+        </div>
+      {:else}
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-edge text-left text-xs text-muted">
+              <th class="px-5 py-3 font-medium">When</th>
+              <th class="px-5 py-3 font-medium">Path</th>
+              <th class="px-5 py-3 font-medium">Signature</th>
+              <th class="px-5 py-3 text-right font-medium">Verdict</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each history as h (h.id)}
+              <tr class="border-b border-edge/50 last:border-0">
+                <td class="whitespace-nowrap px-5 py-3 text-xs text-muted"
+                  >{formatTime(h.detected_at)}</td
+                >
+                <td class="max-w-72 truncate px-5 py-3 font-mono text-xs" title={h.path}>
+                  {h.path}
+                </td>
+                <td class="px-5 py-3 text-xs">{h.signature}</td>
+                <td class="px-5 py-3 text-right">
+                  <span
+                    class="inline-block rounded px-2 py-0.5 font-mono text-[11px] {VERDICT_STYLE[
+                      h.status
+                    ] ?? VERDICT_STYLE.deleted}"
+                  >
+                    {h.status}
+                  </span>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+    </div>
   </div>
 </div>

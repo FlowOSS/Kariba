@@ -3,19 +3,20 @@
 use kariba_core::paths;
 use kariba_ipc::protocol::{
     IdParams, QuarantineItem, ScanHistoryItem, ScanParams, ScanResult, Settings, SettingsSetParams,
-    StatusResult, method,
+    StatusResult, ThreatHistoryItem, ThreatStatusFilter, method,
 };
 use kariba_ipc::{Client, Notification};
 use serde_json::Value;
 use tauri::Emitter;
 
 fn connect() -> Result<Client, String> {
-    let socket = paths::socket_path();
-    Client::connect(&socket).map_err(|e| {
-        format!(
-            "cannot reach karibad at {} ({e}). Start it first: karibad",
-            socket.display()
-        )
+    kariba_ipc::connect_daemon().map_err(|e| {
+        let tried = paths::socket_candidates()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("cannot reach karibad (tried {tried}): {e}. Start it first: karibad")
     })
 }
 
@@ -90,8 +91,7 @@ async fn settings_get() -> Result<Settings, String> {
 async fn realtime_events(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         loop {
-            let socket = paths::socket_path();
-            if let Ok(mut client) = Client::connect(&socket) {
+            if let Ok(mut client) = kariba_ipc::connect_daemon() {
                 let _ = client.subscribe(|notification| {
                     let event = match notification.method.as_str() {
                         method::REALTIME_DETECTION => "kariba://realtime-detection",
@@ -176,6 +176,18 @@ async fn scan_history() -> Result<Vec<ScanHistoryItem>, String> {
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+async fn threats_history(status: Option<String>) -> Result<Vec<ThreatHistoryItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let filter = ThreatStatusFilter { status };
+        let params = serde_json::to_value(filter).map_err(|e| e.to_string())?;
+        let value = call(method::THREATS_LIST, params)?;
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Workaround for WebKitGTK crashing on NVIDIA + Wayland with
 /// "Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display".
 ///
@@ -215,6 +227,7 @@ fn main() {
             quarantine_list,
             quarantine_restore,
             quarantine_delete,
+            threats_history,
             settings_get,
             settings_set,
             realtime_events

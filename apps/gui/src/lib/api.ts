@@ -10,6 +10,7 @@ import type {
   SurveyReport,
   Settings,
   RealtimeDetection,
+  ThreatHistoryItem,
 } from "./types";
 
 export function daemonStatus(): Promise<StatusResult> {
@@ -46,6 +47,10 @@ export function quarantineRestore(id: number): Promise<string> {
 
 export function quarantineDelete(id: number): Promise<boolean> {
   return invoke<boolean>("quarantine_delete", { id });
+}
+
+export function threatsHistory(status?: string): Promise<ThreatHistoryItem[]> {
+  return invoke<ThreatHistoryItem[]>("threats_history", { status: status ?? null });
 }
 
 export function settingsGet(): Promise<Settings> {

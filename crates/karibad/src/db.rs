@@ -46,6 +46,17 @@ pub struct QuarantineRow {
     pub signature: String,
 }
 
+pub struct ThreatRow {
+    pub id: u64,
+    pub path: String,
+    pub sha256: String,
+    pub engine: String,
+    pub signature: String,
+    pub detected_at: u64,
+    // detected | quarantined | restored | deleted
+    pub status: String,
+}
+
 pub struct ScanRow {
     pub id: u64,
     pub kind: String,
@@ -185,6 +196,34 @@ impl Db {
         (count("scans"), count("threats"), count("quarantine"))
     }
 
+    /// Threat history. The threats table is append-only — one row per
+    /// detection event, so identical files detected repeatedly yield one row
+    /// each; restore/delete only flip `status`, never remove rows.
+    pub fn list_threats(&self, status: Option<&str>, limit: u64) -> Vec<ThreatRow> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, path, sha256, engine, signature, detected_at, status
+                 FROM threats
+                 WHERE (?1 IS NULL OR status = ?1)
+                 ORDER BY id DESC LIMIT ?2",
+            )
+            .expect("threat history query is valid");
+        stmt.query_map(params![status, limit as i64], |row| {
+            Ok(ThreatRow {
+                id: row.get::<_, i64>(0)? as u64,
+                path: row.get(1)?,
+                sha256: row.get(2)?,
+                engine: row.get(3)?,
+                signature: row.get(4)?,
+                detected_at: row.get::<_, i64>(5)? as u64,
+                status: row.get(6)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
     pub fn list_scans(&self, limit: u64) -> Vec<ScanRow> {
         let mut stmt = self
             .conn
@@ -241,5 +280,35 @@ mod tests {
         assert!(db.list_quarantine().is_empty());
 
         db.finish_scan(scan_id, 100, 1, "completed");
+    }
+
+    #[test]
+    fn threat_history_preserves_duplicates_and_status_transitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("test.db")).unwrap();
+
+        let scan_id = db.insert_scan("custom", &["/tmp".into()]);
+        // Same file detected twice: two distinct history rows, never deduped.
+        let first = db.insert_threat(scan_id, "/tmp/x", "abc", "ClamAV", "Test.Sig");
+        let second = db.insert_threat(scan_id, "/tmp/x", "abc", "ClamAV", "Test.Sig");
+        assert_ne!(first, second);
+        assert_eq!(db.list_threats(None, 50).len(), 2);
+
+        // Lifecycle: quarantined -> restored. The row survives resolution.
+        db.set_threat_status(first, "quarantined");
+        db.set_threat_status(first, "restored");
+        db.set_threat_status(second, "quarantined");
+        db.set_threat_status(second, "deleted");
+
+        let all = db.list_threats(None, 50);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].status, "deleted"); // newest first
+        assert_eq!(all[1].status, "restored");
+
+        let restored = db.list_threats(Some("restored"), 50);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, first);
+
+        assert!(db.list_threats(Some("detected"), 50).is_empty());
     }
 }

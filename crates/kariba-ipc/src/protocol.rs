@@ -13,6 +13,7 @@ pub mod method {
     pub const SCAN_START: &str = "scan.start";
     pub const SCAN_CANCEL: &str = "scan.cancel";
     pub const SCAN_HISTORY: &str = "scan.history";
+    pub const THREATS_LIST: &str = "threats.list";
     pub const QUARANTINE_LIST: &str = "quarantine.list";
     pub const QUARANTINE_RESTORE: &str = "quarantine.restore";
     pub const QUARANTINE_DELETE: &str = "quarantine.delete";
@@ -196,6 +197,25 @@ pub struct ScanHistoryItem {
     pub finished_at: Option<u64>,
     pub files_scanned: u64,
     pub threats_found: u32,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreatStatusFilter {
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+// One row per detection event; identical files detected repeatedly are
+// separate rows. status: detected | quarantined | restored | deleted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreatHistoryItem {
+    pub id: u64,
+    pub path: String,
+    pub sha256: String,
+    pub engine: String,
+    pub signature: String,
+    pub detected_at: u64,
     pub status: String,
 }
 

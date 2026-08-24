@@ -106,4 +106,14 @@ export interface QuarantineItem {
   quarantined_at: number;
 }
 
+export interface ThreatHistoryItem {
+  id: number;
+  path: string;
+  sha256: string;
+  engine: string;
+  signature: string;
+  detected_at: number;
+  status: string;
+}
+
 export type View = "dashboard" | "scan" | "quarantine" | "survey" | "settings";

@@ -3,7 +3,8 @@ use kariba_core::paths;
 use kariba_ipc::client::{reader, respond};
 use kariba_ipc::protocol::{
     IdParams, QuarantineItem, RpcError, ScanHistoryItem, ScanParams, SettingsSetParams,
-    StatusResult, WireMessage, error_code, method, parse_line,
+    StatusResult, ThreatHistoryItem, ThreatStatusFilter, WireMessage, error_code, method,
+    parse_line,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
@@ -20,6 +21,7 @@ use crate::realtime;
 use crate::scanner;
 
 const HISTORY_LIMIT: u64 = 20;
+const THREATS_LIMIT: u64 = 200;
 
 pub struct Daemon {
     started_at: Instant,
@@ -232,6 +234,26 @@ fn dispatch(
                     finished_at: r.finished_at,
                     files_scanned: r.files_scanned,
                     threats_found: r.threats_found,
+                    status: r.status,
+                })
+                .collect();
+            serde_json::to_value(items).map_err(server_err)
+        }
+
+        method::THREATS_LIST => {
+            let filter: ThreatStatusFilter =
+                serde_json::from_value(params).unwrap_or(ThreatStatusFilter { status: None });
+            let db = lock_db(daemon)?;
+            let items: Vec<ThreatHistoryItem> = db
+                .list_threats(filter.status.as_deref(), THREATS_LIMIT)
+                .into_iter()
+                .map(|r| ThreatHistoryItem {
+                    id: r.id,
+                    path: r.path,
+                    sha256: r.sha256,
+                    engine: r.engine,
+                    signature: r.signature,
+                    detected_at: r.detected_at,
                     status: r.status,
                 })
                 .collect();
