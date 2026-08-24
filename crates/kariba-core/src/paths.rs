@@ -1,10 +1,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// System paths are only usable by root; picking them by directory
+// existence alone breaks non-root clients when a root daemon also runs on
+// the same machine (the dirs already exist but are not writable).
+fn running_as_root() -> bool {
+    current_uid() == Some(0)
+}
+
 pub fn runtime_dir() -> PathBuf {
-    let system = PathBuf::from("/run/kariba");
-    if fs::create_dir_all(&system).is_ok() {
-        return system;
+    if running_as_root() {
+        let system = PathBuf::from("/run/kariba");
+        if fs::create_dir_all(&system).is_ok() {
+            return system;
+        }
     }
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         let dir = PathBuf::from(xdg).join("kariba");
@@ -18,9 +27,11 @@ pub fn runtime_dir() -> PathBuf {
 }
 
 pub fn data_dir() -> PathBuf {
-    let system = PathBuf::from("/var/lib/kariba");
-    if fs::create_dir_all(&system).is_ok() {
-        return system;
+    if running_as_root() {
+        let system = PathBuf::from("/var/lib/kariba");
+        if fs::create_dir_all(&system).is_ok() {
+            return system;
+        }
     }
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         let dir = PathBuf::from(xdg).join("kariba");
@@ -47,9 +58,11 @@ pub fn quarantine_dir() -> PathBuf {
 }
 
 pub fn config_dir() -> PathBuf {
-    let system = PathBuf::from("/etc/kariba");
-    if fs::create_dir_all(&system).is_ok() {
-        return system;
+    if running_as_root() {
+        let system = PathBuf::from("/etc/kariba");
+        if fs::create_dir_all(&system).is_ok() {
+            return system;
+        }
     }
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         return PathBuf::from(xdg).join("kariba");
