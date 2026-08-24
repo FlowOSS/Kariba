@@ -14,6 +14,34 @@ use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
 fn main() {
+    // Raise the fd limit to the hard cap: fanotify event fds, worker file
+    // handles and clamd connections all count, and the default soft limit
+    // (often 1024 under sudo) was exhausted by bursts.
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+            lim.rlim_cur = lim.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                eprintln!(
+                    "karibad: warning: could not raise fd limit: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    // Graceful shutdown: SIGTERM/SIGINT stop the real-time watcher, which
+    // persists whatever is still queued so the next start resumes it.
+    // Block the signals in every thread (masks are inherited) so only the
+    // sigwait thread below handles them.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+
     let socket = paths::socket_path();
     if socket.exists() {
         let _ = std::fs::remove_file(&socket);
@@ -54,6 +82,25 @@ fn main() {
         config_path.clone(),
     ));
     daemon.sync_realtime();
+
+    {
+        let daemon = Arc::clone(&daemon);
+        let _ = std::thread::Builder::new()
+            .name("kariba-signals".into())
+            .spawn(move || {
+                let mut sig: libc::c_int = 0;
+                unsafe {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGTERM);
+                    libc::sigaddset(&mut set, libc::SIGINT);
+                    libc::sigwait(&set, &mut sig);
+                }
+                eprintln!("karibad: received signal {sig}, shutting down gracefully");
+                daemon.stop_realtime();
+                std::process::exit(0);
+            });
+    }
 
     let listener = match UnixListener::bind(&socket) {
         Ok(listener) => listener,

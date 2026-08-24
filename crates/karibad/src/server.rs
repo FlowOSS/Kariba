@@ -50,6 +50,15 @@ impl Daemon {
         }
     }
 
+    /// Stop the running watcher, if any. Graceful shutdown path: the
+    /// watcher persists whatever is still queued for the next lifetime.
+    pub fn stop_realtime(&self) {
+        let handle = self.realtime.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(handle) = handle {
+            handle.stop();
+        }
+    }
+
     /// Align the watcher with `realtime.enabled`. Called at startup and
     /// after every settings change (a restart re-snapshots exclusions and
     /// the auto-quarantine flag). Safe to call repeatedly.
@@ -102,16 +111,26 @@ impl Daemon {
     }
 
     pub fn realtime_status(&self) -> (bool, String) {
-        let active = self
+        let (active, note) = self
             .realtime
             .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false);
+            .map(|slot| match slot.as_ref() {
+                Some(handle) => (true, handle.status_note()),
+                None => (false, None),
+            })
+            .unwrap_or((false, None));
         let detail = self
             .realtime_detail
             .lock()
             .map(|d| d.clone())
             .unwrap_or_default();
+        // Runtime notes (queue overflow, failed-open, stall restarts)
+        // ride along with the startup "watching N mounts" detail.
+        let detail = match note {
+            Some(note) if !detail.is_empty() => format!("{detail}; {note}"),
+            Some(note) => note,
+            None => detail,
+        };
         (active, detail)
     }
 }

@@ -1,5 +1,5 @@
 use rusqlite::{Connection, params};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = "
@@ -31,6 +31,13 @@ CREATE TABLE IF NOT EXISTS quarantine (
     original_mode  INTEGER NOT NULL,
     size           INTEGER NOT NULL,
     quarantined_at INTEGER NOT NULL
+);
+-- Real-time scan queue overflow. Close-write events beyond the in-memory
+-- queue cap spill here so coverage survives bursts and daemon restarts;
+-- the watcher drains this table after the in-memory queue.
+CREATE TABLE IF NOT EXISTS pending_scans (
+    path      TEXT PRIMARY KEY,
+    queued_at INTEGER NOT NULL
 );
 ";
 
@@ -203,6 +210,58 @@ impl Db {
             .execute("DELETE FROM quarantine WHERE id = ?1", params![id as i64]);
     }
 
+    /// Spill queued scan paths to disk. `INSERT OR IGNORE` keeps the dedup
+    /// guarantee across restarts: one pending row per path. Batched in a
+    /// transaction — per-statement autocommit would fsync once per path.
+    pub fn spill_pending(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        let Ok(tx) = self.conn.transaction() else {
+            return;
+        };
+        let now = Self::now() as i64;
+        {
+            let mut stmt = tx
+                .prepare("INSERT OR IGNORE INTO pending_scans (path, queued_at) VALUES (?1, ?2)")
+                .expect("pending insert is valid");
+            for path in paths {
+                let _ = stmt.execute(params![path.display().to_string(), now]);
+            }
+        }
+        let _ = tx.commit();
+    }
+
+    /// Take up to `limit` pending paths for scanning and remove them.
+    pub fn take_pending(&mut self, limit: u64) -> Vec<PathBuf> {
+        let paths: Vec<PathBuf> = self
+            .conn
+            .prepare("SELECT path FROM pending_scans ORDER BY queued_at LIMIT ?1")
+            .expect("pending select is valid")
+            .query_map(params![limit as i64], |row| {
+                let path: String = row.get(0)?;
+                Ok(PathBuf::from(path))
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default();
+        if !paths.is_empty() {
+            let _ = self.conn.execute(
+                "DELETE FROM pending_scans WHERE path IN (SELECT path FROM pending_scans ORDER BY queued_at LIMIT ?1)",
+                params![limit as i64],
+            );
+        }
+        paths
+    }
+
+    #[allow(dead_code)] // exercised by tests; future status surface
+    pub fn pending_count(&self) -> u64 {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM pending_scans", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or(0) as u64
+    }
+
     pub fn counts(&self) -> (u64, u64, u64) {
         let count = |table: &str| -> u64 {
             self.conn
@@ -345,5 +404,24 @@ mod tests {
         let q_rows = db.list_quarantine();
         assert_eq!(q_rows.len(), 1);
         assert_eq!(q_rows[0].source, "realtime");
+    }
+
+    #[test]
+    fn pending_queue_spills_dedupes_and_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("test.db")).unwrap();
+
+        let paths = vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
+        db.spill_pending(&paths);
+        // Re-spilling the same paths must not duplicate rows.
+        db.spill_pending(&[PathBuf::from("/tmp/b"), PathBuf::from("/tmp/c")]);
+        assert_eq!(db.pending_count(), 3);
+
+        let taken = db.take_pending(2);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(db.pending_count(), 1);
+        let rest = db.take_pending(10);
+        assert_eq!(rest, vec![PathBuf::from("/tmp/c")]);
+        assert!(db.take_pending(10).is_empty());
     }
 }

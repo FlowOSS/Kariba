@@ -1,16 +1,40 @@
 use kariba_core::clamav;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(3);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const INSTREAM_CHUNK: usize = 64 * 1024;
 // clamd's default StreamMaxLength; larger files fall back to a path-based
-// SCAN where clamd opens the file itself.
+// SCAN of a readable copy (see bigscan_copy).
 const STREAM_MAX: u64 = 25 * 1024 * 1024;
+// World-readable scratch for oversized copies: karibad (root) can read any
+// file, but clamd runs as the unprivileged `clamav` user and cannot enter
+// mode-700 homes, so path-based SCAN of the original would EACCES there.
+const BIGSCAN_DIR: &str = "/tmp/kariba-bigscan";
+
+static BIGSCAN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Copy an oversized file somewhere clamd can read. The copy is mode 0644
+/// regardless of the original's permissions; the caller deletes it after.
+fn bigscan_copy(path: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(BIGSCAN_DIR)?;
+    fs::set_permissions(BIGSCAN_DIR, fs::Permissions::from_mode(0o755))?;
+    let name = format!(
+        "kariba-{}-{}.scan",
+        std::process::id(),
+        BIGSCAN_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let dest = Path::new(BIGSCAN_DIR).join(name);
+    fs::copy(path, &dest)?;
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o644))?;
+    Ok(dest)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanOutcome {
@@ -29,6 +53,13 @@ pub struct ClamdClient {
 impl ClamdClient {
     pub fn connect() -> io::Result<Self> {
         Self::connect_with_read_timeout(READ_TIMEOUT)
+    }
+
+    /// A duplicate handle on the underlying socket, so a watcher can
+    /// interrupt a blocked scan (shutdown on the handle makes pending
+    /// reads return immediately).
+    pub fn stream_handle(&self) -> io::Result<UnixStream> {
+        self.stream.try_clone()
     }
 
     /// Real-time verdicts need a short, bounded read timeout so a slow engine
@@ -89,15 +120,18 @@ impl ClamdClient {
         // Stream the file contents to clamd (INSTREAM) instead of sending
         // the path: karibad runs as root and can open anything, while clamd
         // runs as the unprivileged `clamav` user, which cannot traverse
-        // mode-700 home directories. Path-based SCAN is only used for files
-        // beyond clamd's StreamMaxLength.
-        let use_instream = fs::metadata(path)
-            .map(|m| m.len() <= STREAM_MAX)
-            .unwrap_or(true);
-        let outcome = if use_instream {
+        // mode-700 home directories. Files beyond clamd's StreamMaxLength
+        // can't be streamed, so they are copied to a world-readable scratch
+        // path and scanned there (path-based SCAN of the original would
+        // fail with EACCES inside private homes).
+        let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let outcome = if len <= STREAM_MAX {
             self.instream(path)
         } else {
-            self.scan_command(path)
+            let copy = bigscan_copy(path)?;
+            let outcome = self.scan_command(&copy);
+            let _ = fs::remove_file(&copy);
+            outcome
         };
         self.last_command = Instant::now();
         outcome

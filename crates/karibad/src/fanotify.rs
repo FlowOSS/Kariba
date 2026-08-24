@@ -15,7 +15,10 @@ use std::path::Path;
 // fanotify_init flags
 const FAN_CLOEXEC: libc::c_uint = 0x0000_0001;
 const FAN_CLASS_CONTENT: libc::c_uint = 0x0000_0004;
-const FAN_UNLIMITED_QUEUE: libc::c_uint = 0x0000_0010;
+// Deliberately NOT using FAN_UNLIMITED_QUEUE: an unlimited kernel queue
+// plus any reader stall pins one fd + inode per pending event system-wide
+// (that froze a machine on 2026-08-24). The bounded queue overflows with a
+// FAN_Q_OVERFLOW event instead — detectable, recoverable loss.
 const FAN_UNLIMITED_MARKS: libc::c_uint = 0x0000_0020;
 
 // fanotify_mark flags
@@ -25,6 +28,7 @@ const FAN_MARK_MOUNT: libc::c_uint = 0x0000_0010;
 // Event mask bits
 pub const FAN_CLOSE_WRITE: u64 = 0x0000_0008;
 pub const FAN_OPEN_EXEC_PERM: u64 = 0x0004_0000;
+pub const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
 
 // Verdicts
 const FAN_ALLOW: u32 = 1;
@@ -60,9 +64,10 @@ pub struct Event {
 }
 
 /// fanotify group in CONTENT class (required for permission events) with
-/// unlimited queue and marks — an AV must not silently drop events.
+/// unlimited marks but a BOUNDED event queue — overflow is reported via
+/// FAN_Q_OVERFLOW rather than pinning unbounded kernel resources.
 pub fn init() -> io::Result<RawFd> {
-    let flags = FAN_CLOEXEC | FAN_CLASS_CONTENT | FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS;
+    let flags = FAN_CLOEXEC | FAN_CLASS_CONTENT | FAN_UNLIMITED_MARKS;
     let event_flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_LARGEFILE) as libc::c_uint;
     let fd = unsafe { libc::fanotify_init(flags, event_flags) };
     if fd < 0 {
