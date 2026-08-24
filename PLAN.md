@@ -306,6 +306,15 @@ If karibad dies, the kernel auto-allows pending permission events
 (fail-open is kernel behavior, not a choice) — service supervision with
 restart-on-crash is the mitigation.
 
+**Engine I/O — INSTREAM, not paths.** karibad streams file *contents* to
+clamd (`zINSTREAM`) instead of sending paths: the daemon runs as root and
+can open anything, while clamd runs as the unprivileged `clamav` user,
+which cannot traverse mode-700 home directories — path-based `SCAN`
+silently misses every file in a private home (discovered in E2E testing
+2026-08-24). Files beyond clamd's `StreamMaxLength` (default 25 MB) fall
+back to path-based SCAN. INSTREAM responses are NUL-terminated, unlike
+SCAN's newline-terminated replies.
+
 **Known race.** Between close-write and its async verdict, a non-exec read
 can touch a fresh file. Accepted: the exec gate closes the dangerous path
 (files that merely get read can't run code), matching the minifilter model.
@@ -684,6 +693,8 @@ can show protection state. CLI parity: `kariba-cli settings`,
 
 **Exit criteria:** EICAR test file detected on download, blocked from
 execution, and auto-quarantined — on the dev machine (Artix/OpenRC).
+`[verified 2026-08-24]` via the real-time watcher: landing detection,
+exec-gate denial, and auto-quarantine all demonstrated end-to-end.
 Ubuntu (deb) / Fedora (rpm) verification is deferred `[ASSUMPTION]` — see
 Assumptions to Verify.
 
@@ -817,8 +828,13 @@ names free; no conflicting security product; GitHub org handled by
    `settings.get`/`settings.set` RPC, GUI settings page with protection
    toggles + exclusion manager, CLI parity. Real-time master toggle ships
    ahead of the fanotify slice so users can opt out before it exists.
-10. Real-time protection — fanotify watcher on `~/Downloads` + `/tmp`,
-    gated by `realtime.enabled`
+10. ~~Real-time protection~~ ✓ (2026-08-24) — fanotify watcher, mount-wide
+    marks, exec gate + scan-on-close, verdict cache, fail-open policy, live
+    `realtime.enabled` toggle, INSTREAM scanning (mode-700 homes covered),
+    GUI live-detection feed. E2E verified on the Artix dev box: EICAR write
+    detected on landing (respecting `auto_quarantine`), exec attempt denied
+    by the gate (`Operation not permitted`, exit 126), re-enabled
+    auto-quarantine moved the file on the next blocked exec.
 11. Packaging: systemd unit `[ASSUMPTION]` + OpenRC script
 12. Push to `FlowOSS/kariba`, alpha release for community feedback
 
