@@ -11,13 +11,7 @@
   } from "@lucide/svelte";
   import * as api from "../lib/api";
   import { fmtRel } from "../lib/format";
-  import type {
-    RealtimeDetection,
-    ScanHistoryItem,
-    StatusResult,
-    SurveyReport,
-    View,
-  } from "../lib/types";
+  import type { ScanHistoryItem, StatusResult, SurveyReport, View } from "../lib/types";
 
   let {
     onquickscan,
@@ -29,15 +23,6 @@
   let lastScan = $state<ScanHistoryItem | null>(null);
   let daemonUp = $state(true);
   let loading = $state(true);
-  let rtDetections = $state<RealtimeDetection[]>([]);
-
-  $effect(() => {
-    let unlisten: (() => void) | undefined;
-    api.onRealtimeDetection((d) => {
-      rtDetections = [d, ...rtDetections].slice(0, 5);
-    }).then((u) => (unlisten = u));
-    return () => unlisten?.();
-  });
 
   async function load() {
     loading = true;
@@ -102,23 +87,7 @@
   <div class="mb-6 grid grid-cols-3 gap-4">
     <div class="card col-span-1 p-6">
       <div class="label mb-4">System status</div>
-  {#if rtDetections.length > 0}
-    <div class="card mb-6 border-danger/40 bg-danger/5 p-5">
-      <div class="mb-3 flex items-center gap-2.5 font-medium text-danger">
-        <ShieldAlert size={18} /> Real-time detection{rtDetections.length > 1 ? "s" : ""}
-      </div>
-      <div class="space-y-2">
-        {#each rtDetections as d (d.path + d.signature + d.action)}
-          <div class="text-xs">
-            <span class="font-mono text-ink">{d.path}</span>
-            <span class="text-muted"> · {d.signature} · {d.action}</span>
-          </div>
-        {/each}
-      </div>
-    </div>
-  {/if}
-
-  {#if !daemonUp}
+      {#if !daemonUp}
         <div class="flex items-center gap-3 text-danger">
           <ShieldOff size={34} />
           <div>

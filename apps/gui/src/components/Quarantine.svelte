@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Archive, RotateCcw, Trash2, RefreshCw, History } from "@lucide/svelte";
+  import { Archive, RotateCcw, Trash2, RefreshCw, History, Zap } from "@lucide/svelte";
   import * as api from "../lib/api";
   import type { QuarantineItem, ThreatHistoryItem } from "../lib/types";
 
@@ -29,6 +29,22 @@
     loading = false;
   }
   load();
+
+  // Real-time catches land here; refresh the lists when one arrives.
+  $effect(() => {
+    let unlisten: (() => void) | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    api
+      .onRealtimeDetection(() => {
+        clearTimeout(timer);
+        timer = setTimeout(load, 300);
+      })
+      .then((u) => (unlisten = u));
+    return () => {
+      clearTimeout(timer);
+      unlisten?.();
+    };
+  });
 
   async function restore(item: QuarantineItem) {
     try {
@@ -104,8 +120,15 @@
           {#each items as item (item.id)}
             <tr class="border-b border-edge/50 last:border-0">
               <td class="px-5 py-3 font-mono text-xs text-muted">{item.id}</td>
-              <td class="max-w-64 truncate px-5 py-3 font-mono text-xs" title={item.original_path}>
-                {item.original_path}
+              <td class="max-w-64 px-5 py-3">
+                <div class="truncate font-mono text-xs" title={item.original_path}>
+                  {item.original_path}
+                </div>
+                {#if item.source === "realtime"}
+                  <div class="mt-1 flex items-center gap-1 text-[11px] text-accent">
+                    <Zap size={11} /> caught in real time
+                  </div>
+                {/if}
               </td>
               <td class="px-5 py-3 text-xs">{item.signature}</td>
               <td class="px-5 py-3 font-mono text-xs text-muted">{formatSize(item.size)}</td>
@@ -167,6 +190,14 @@
                 </td>
                 <td class="px-5 py-3 text-xs">{h.signature}</td>
                 <td class="px-5 py-3 text-right">
+                  {#if h.source === "realtime"}
+                    <span
+                      class="mr-1.5 inline-flex items-center gap-1 rounded bg-accent/15 px-1.5 py-0.5 text-[11px] text-accent"
+                      title="Caught in real time"
+                    >
+                      <Zap size={10} /> real-time
+                    </span>
+                  {/if}
                   <span
                     class="inline-block rounded px-2 py-0.5 font-mono text-[11px] {VERDICT_STYLE[
                       h.status

@@ -255,6 +255,7 @@ fn dispatch(
                     signature: r.signature,
                     detected_at: r.detected_at,
                     status: r.status,
+                    source: r.source,
                 })
                 .collect();
             serde_json::to_value(items).map_err(server_err)
@@ -272,6 +273,7 @@ fn dispatch(
                     signature: r.signature,
                     size: r.size,
                     quarantined_at: r.quarantined_at,
+                    source: r.source,
                 })
                 .collect();
             serde_json::to_value(items).map_err(server_err)

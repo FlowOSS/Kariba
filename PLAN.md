@@ -774,11 +774,11 @@ Exposed during GUI testing (2026-08-23) — fix before alpha:
 1. **Sequential scan throughput** — ~60 files/s on `/usr` (single clamd
    connection, one round-trip per file). Phase 3 parallel scanning (worker
    pool + multiple clamd connections or `INSTREAM` batching) addresses this.
-2. **Real-time detections placement** — live detections render inside the
-   Dashboard system-status area, which works but looks ugly. They need a
-   dedicated place (activity feed / own section) plus proper desktop
-   notifications (detection while the GUI is closed is currently silent).
-   Feeds into the still-missing system tray + notification story.
+2. **Real-time catch awareness** — detections now surface in Quarantine
+   (marked "caught in real time", auto-refresh on arrival) with an unread
+   dot on the sidebar tab; the Dashboard status card no longer carries a
+   detection list. Still open: desktop notifications and a system tray for
+   when the GUI is closed or unfocused.
 
 Resolved (2026-08-23): DB lock held for whole scan (scanner now takes
 short-lived locks per DB operation; GUI commands are async, so status /
@@ -854,6 +854,13 @@ names free; no conflicting security product; GitHub org handled by
     auto-quarantine moved the file on the next blocked exec.
 11. Packaging: systemd unit `[ASSUMPTION]` + OpenRC script
 12. Push to `FlowOSS/kariba`, alpha release for community feedback
+
+**Versioning.** Kariba follows semver strictly. Everything pre-release lives
+in `0.x`: the current state is not yet worthy of a shipped build, so the
+workspace sits at `0.0.1` (development-only, never released). First public
+builds use prerelease tags (`0.1.0-alpha.1`, `0.1.0-beta.1`); plain
+`0.1.0` lands only when there is an MVP actually worth testing. Packaging
+(item 11) is deliberately deferred until that point.
 
 ## Assumptions to Verify
 

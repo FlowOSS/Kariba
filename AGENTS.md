@@ -7,7 +7,7 @@ Kariba: Linux security suite unifying external engines (currently ClamAV only) b
 - `cargo test --workspace` — fast, no external services required
 - Single test: `cargo test -p kariba-core expand_tilde`
 - Lint: `cargo clippy --workspace`; format: `cargo fmt` (rustfmt.toml sets edition 2024)
-- Run daemon: `cargo run -p karibad`; CLI: `cargo run -p kariba-cli -- survey|status|scan <paths> [--quarantine|--no-quarantine]|quarantine list|restore <id>|delete <id>|settings|settings set <key> <value>|settings restore-builtins`
+- Run daemon: `cargo run -p karibad`; CLI: `cargo run -p kariba-cli -- survey|status|scan <paths> [--quarantine|--no-quarantine]|quarantine list|restore <id>|delete <id>|threats [--status <s>]|settings|settings set <key> <value>|settings restore-builtins`
 - GUI: `cd apps/gui && pnpm install` first (lockfile is pnpm), then `pnpm tauri dev` (starts Vite itself on :1420) and `pnpm check` (svelte-check) for typechecking
 
 ## Architecture

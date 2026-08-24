@@ -295,16 +295,17 @@ fn run_threats(status: Option<String>) -> Result<i32, kariba_ipc::RpcError> {
             println!("no detections recorded");
             return Ok(0);
         }
-        const HEADER: [&str; 5] = ["WHEN", "VERDICT", "ENGINE", "SIGNATURE", "PATH"];
+        const HEADER: [&str; 6] = ["WHEN", "VERDICT", "SOURCE", "ENGINE", "SIGNATURE", "PATH"];
         println!(
-            "{:<10} {:<12} {:<12} {:<24} {}",
-            HEADER[0], HEADER[1], HEADER[2], HEADER[3], HEADER[4]
+            "{:<10} {:<12} {:<9} {:<12} {:<24} {}",
+            HEADER[0], HEADER[1], HEADER[2], HEADER[3], HEADER[4], HEADER[5]
         );
         for item in items {
             println!(
-                "{:<10} {:<12} {:<12} {:<24} {}",
+                "{:<10} {:<12} {:<9} {:<12} {:<24} {}",
                 ago(item.detected_at),
                 item.status,
+                item.source,
                 item.engine,
                 item.signature,
                 item.path

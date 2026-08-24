@@ -44,6 +44,8 @@ pub struct QuarantineRow {
     pub quarantined_at: u64,
     pub engine: String,
     pub signature: String,
+    // "scan" | "realtime"
+    pub source: String,
 }
 
 pub struct ThreatRow {
@@ -55,6 +57,8 @@ pub struct ThreatRow {
     pub detected_at: u64,
     // detected | quarantined | restored | deleted
     pub status: String,
+    // "scan" | "realtime"
+    pub source: String,
 }
 
 pub struct ScanRow {
@@ -70,6 +74,16 @@ pub struct ScanRow {
 
 pub struct Db {
     conn: Connection,
+}
+
+/// Detections are grouped under their scan row; real-time catches live under
+/// the sentinel "realtime" scan (see realtime.rs).
+fn source_from_kind(kind: &str) -> String {
+    if kind == "realtime" {
+        "realtime".into()
+    } else {
+        "scan".into()
+    }
 }
 
 impl Db {
@@ -153,12 +167,15 @@ impl Db {
             .conn
             .prepare(
                 "SELECT q.id, q.threat_id, q.original_path, q.blob_path, q.original_mode,
-                        q.size, q.quarantined_at, t.engine, t.signature
-                 FROM quarantine q JOIN threats t ON t.id = q.threat_id
+                        q.size, q.quarantined_at, t.engine, t.signature, s.kind
+                 FROM quarantine q
+                 JOIN threats t ON t.id = q.threat_id
+                 JOIN scans s ON s.id = t.scan_id
                  ORDER BY q.id",
             )
             .expect("quarantine list query is valid");
         stmt.query_map([], |row| {
+            let kind: String = row.get(9)?;
             Ok(QuarantineRow {
                 id: row.get::<_, i64>(0)? as u64,
                 threat_id: row.get::<_, i64>(1)? as u64,
@@ -169,6 +186,7 @@ impl Db {
                 quarantined_at: row.get::<_, i64>(6)? as u64,
                 engine: row.get(7)?,
                 signature: row.get(8)?,
+                source: source_from_kind(&kind),
             })
         })
         .map(|rows| rows.flatten().collect())
@@ -203,13 +221,16 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, path, sha256, engine, signature, detected_at, status
-                 FROM threats
-                 WHERE (?1 IS NULL OR status = ?1)
-                 ORDER BY id DESC LIMIT ?2",
+                "SELECT t.id, t.path, t.sha256, t.engine, t.signature, t.detected_at,
+                        t.status, s.kind
+                 FROM threats t
+                 JOIN scans s ON s.id = t.scan_id
+                 WHERE (?1 IS NULL OR t.status = ?1)
+                 ORDER BY t.id DESC LIMIT ?2",
             )
             .expect("threat history query is valid");
         stmt.query_map(params![status, limit as i64], |row| {
+            let kind: String = row.get(7)?;
             Ok(ThreatRow {
                 id: row.get::<_, i64>(0)? as u64,
                 path: row.get(1)?,
@@ -218,6 +239,7 @@ impl Db {
                 signature: row.get(4)?,
                 detected_at: row.get::<_, i64>(5)? as u64,
                 status: row.get(6)?,
+                source: source_from_kind(&kind),
             })
         })
         .map(|rows| rows.flatten().collect())
@@ -304,11 +326,24 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].status, "deleted"); // newest first
         assert_eq!(all[1].status, "restored");
+        assert!(all.iter().all(|t| t.source == "scan"));
 
         let restored = db.list_threats(Some("restored"), 50);
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].id, first);
 
         assert!(db.list_threats(Some("detected"), 50).is_empty());
+
+        // Real-time catches sit under the sentinel "realtime" scan row and
+        // are marked as such in history.
+        let rt_scan = db.insert_scan("realtime", &["<real-time protection>".into()]);
+        let rt_threat = db.insert_threat(rt_scan, "/tmp/dropped", "abc", "ClamAV", "Test.Sig");
+        db.insert_quarantine(rt_threat, "/tmp/dropped", "/q/9.quar", 0o644, 3);
+        let rt = db.list_threats(None, 50);
+        assert_eq!(rt[0].id, rt_threat);
+        assert_eq!(rt[0].source, "realtime");
+        let q_rows = db.list_quarantine();
+        assert_eq!(q_rows.len(), 1);
+        assert_eq!(q_rows[0].source, "realtime");
     }
 }

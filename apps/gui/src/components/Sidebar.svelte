@@ -10,7 +10,11 @@
   import type { View } from "../lib/types";
   import { daemonStatus } from "../lib/api";
 
-  let { view, onnavigate }: { view: View; onnavigate: (v: View) => void } = $props();
+  let {
+    view,
+    onnavigate,
+    unseen = 0,
+  }: { view: View; onnavigate: (v: View) => void; unseen?: number } = $props();
 
   let daemonUp = $state<boolean | null>(null);
 
@@ -62,6 +66,12 @@
       >
         <Icon size={16} />
         {label}
+        {#if id === "quarantine" && unseen > 0}
+          <span
+            class="ml-auto h-2 w-2 rounded-full bg-danger"
+            title="{unseen} new real-time catch{unseen > 1 ? 'es' : ''}"
+          ></span>
+        {/if}
       </button>
     {/each}
   </nav>

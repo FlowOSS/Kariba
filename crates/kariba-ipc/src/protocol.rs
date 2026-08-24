@@ -217,6 +217,9 @@ pub struct ThreatHistoryItem {
     pub signature: String,
     pub detected_at: u64,
     pub status: String,
+    // "scan" | "realtime"
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +281,9 @@ pub struct QuarantineItem {
     pub signature: String,
     pub size: u64,
     pub quarantined_at: u64,
+    // "scan" | "realtime"; default keeps older daemons decodable
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
