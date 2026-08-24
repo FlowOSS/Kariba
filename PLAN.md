@@ -261,6 +261,55 @@ it (or a user can run it in a terminal during development). What we ship in
    optional), and resilience — a broken third-party rule must be skipped with
    a warning, never abort a scan.
 
+## Real-time Protection Design
+
+Decisions locked 2026-08-24 (threat-model review: "malware drops files
+anywhere" + "AUR supply-chain hijack").
+
+**Watch scope — mount-wide.** fanotify marks are per-mount, so karibad marks
+each relevant local mount once rather than watching directories. Covered:
+the root filesystem, `/home` and `/tmp` when separately mounted (tmpfs
+included), and removable media as it appears. Never marked: pseudo
+filesystems (proc, sysfs, devtmpfs, devpts, cgroup*, debugfs, securityfs,
+tracefs, squashfs) and network filesystems (nfs, cifs, fuse.sshfs — scanning
+remote bytes synchronously would hang local syscalls). Mounts are discovered
+from `/proc/self/mountinfo`; the exclusions settings (already shipped) decide
+what inside a marked mount is skipped.
+
+**Events.** Two masks per mount:
+
+- `FAN_OPEN_EXEC_PERM` — the exec gate. Synchronous: karibad must ALLOW or
+  DENY before the execve completes. This is the security boundary — a
+  detected payload is refused execution no matter where it landed.
+- `FAN_CLOSE_WRITE` — scan-on-landing. Asynchronous: queued for scanning, no
+  syscall is held. Detections feed the threats table, honor
+  `realtime.auto_quarantine`, and broadcast to connected clients.
+
+**Verdict policy — fail-open + re-scan.** Permission events hold the calling
+process's syscall, so a slow verdict is user-visible. karibad bounds every
+verdict (~2s): cache hit → instant; cache miss → engine scan within the
+deadline; timeout or engine-down → ALLOW, queue a background re-scan, and
+record it. Rationale: an AV that can hang every exec on the system is a
+bigger liability than the residual race, and detection quality (not syscall
+blocking) is where the actual protection comes from. clamd being down
+degrades protection visibly in `status`/dashboard rather than silently.
+
+**Verdict cache.** In-memory `(path, mtime, size) → verdict` so normal
+exec/open churn doesn't round-trip to clamd. sha256 is computed only on
+detection (threat records), keeping the hot path at stat + hashmap lookup.
+
+**Privilege & degradation.** `FAN_CLASS_CONTENT` requires CAP_SYS_ADMIN: a
+non-root dev daemon reports `realtime_active = false` with the reason and
+never crashes. Root-mode testing uses `sudo ./target/debug/karibad` + CLI;
+the GUI↔root-daemon privilege story is polkit work in the packaging phase.
+If karibad dies, the kernel auto-allows pending permission events
+(fail-open is kernel behavior, not a choice) — service supervision with
+restart-on-crash is the mitigation.
+
+**Known race.** Between close-write and its async verdict, a non-exec read
+can touch a fresh file. Accepted: the exec gate closes the dangerous path
+(files that merely get read can't run code), matching the minifilter model.
+
 ## Features
 
 ### Core Features
@@ -277,6 +326,23 @@ it (or a user can run it in a terminal during development). What we ship in
    - Synchronous verdicts: permission events hold the syscall until karibad
      allows/denies, so scan latency is user-visible; needs a timeout policy
      (fail-open + background re-scan vs. deny)
+   - **Watch scope (decided 2026-08-24): mount-wide from day 1.** fanotify
+     marks are per-mount, so marking the root/home/tmp/removable mounts
+     covers files dropped *anywhere* on those filesystems — not just
+     `~/Downloads`. The exclusions settings are the knob that keeps this
+     practical. Pseudo-FS (proc/sys/dev/cgroup/…) and network FS are never
+     marked.
+   - **Verdict policy (decided 2026-08-24): fail-open + re-scan.** A verdict
+     is bounded (~2s); on timeout or engine-down karibad ALLOWS the syscall,
+     queues a background re-scan, and alerts — the system never hangs on a
+     slow engine. The exec gate + detection quality is the security boundary.
+     A verdict cache (path+mtime+size → verdict) keeps the hot path cheap so
+     normal exec/open traffic doesn't re-scan via clamd.
+   - **Scope limit — what real-time does NOT solve:** build-time /
+     supply-chain attacks (see the Supply-chain protection thread below).
+     Scanning catches malicious *artifacts on disk*; it cannot stop a
+     malicious build script from running legitimate tools with the user's own
+     permissions.
 
 2. **On-Demand Scanning**
    - Quick scan (`~/Downloads`, `/tmp`, `/var/tmp`)
@@ -336,6 +402,28 @@ $ kariba update && kariba scan --full
       `clamav` and `clamav-openrc` are separate packages)
     - Engines degrade gracefully: missing engine = "unavailable", never crash
     - Surfaces as `kariba-cli survey` now, GUI "Survey" view later
+
+13. **Supply-chain Protection** `[thread added 2026-08-24]` — Linux malware
+    increasingly arrives via hijacked package builds (e.g. orphaned AUR
+    packages adopted by bad actors), not just dropped files. Real-time
+    scanning catches malicious artifacts on disk but cannot stop a malicious
+    build script running legitimate tools with the user's own permissions, so
+    this threat gets its own layered thread:
+    - **Build isolation** (most effective): build AUR/third-party packages in
+      a clean chroot/container/VM (`devtools`-style), never directly on the
+      host, so a hijacked `PKGBUILD` cannot touch the real system. Kariba's
+      role: Survey-style check that warns when packages are being built
+      directly on host, plus guided setup of an isolated builder.
+    - **Provenance audit**: heuristic flags on AUR metadata — recently
+      orphaned→adopted, recent maintainer change, low votes/last-modified
+      anomalies. Reputation signal, not signatures; surfaced in Survey/GUI.
+    - **File integrity monitoring** (Phase 2, AIDE): detects a package
+      quietly modifying `/usr/bin/*` or `/etc` post-install.
+    - **Behavioral detection** (Phase 3, Tetragon/eBPF): watches what
+      processes *do* (unexpected network/writes during builds) — the
+      living-off-the-land answer.
+    - Honest scope: scanning is necessary but not sufficient here; isolation
+      is the primary boundary.
 
 ### Advanced Features (Future)
 
@@ -587,8 +675,10 @@ can show protection state. CLI parity: `kariba-cli settings`,
    filesystem walk, results UI.
 3. **Quarantine** — move to `/var/lib/kariba/quarantine`, mode 000, metadata
    in SQLite, restore/delete/export.
-4. **Real-time Protection** — fanotify watcher on `~/Downloads`, `/tmp`;
-   auto-scan on close, auto-quarantine on detection.
+4. **Real-time Protection** — fanotify watcher, mount-wide marks (root,
+   `/home`, `/tmp`, removable on mount); exec gate (`FAN_OPEN_EXEC_PERM`) +
+   scan-on-close (`FAN_CLOSE_WRITE`), verdict cache, fail-open timeout
+   policy, auto-quarantine on detection, live `realtime.enabled` toggle.
 5. **System Tray + Basic UI** — status icon, dashboard, scan view, results,
    settings (real-time toggle, exclusions).
 
@@ -756,6 +846,12 @@ verify these when we reach the relevant systems:
   signature-base / vendor-published rules, and which redistribution-clean
   subset can be bundled vs. must be fetched at runtime
 - [ ] polkit agent availability/behavior across desktops (KDE/GNOME/Xfce)
+- [ ] fanotify: raw-libc bindings vs. a mature crate; FAN_OPEN_EXEC_PERM
+      needs kernel ≥5.0; tmpfs `/tmp` marks; btrfs subvolume coverage
+      (one mark per mount should cover subvolumes); event throughput on a
+      busy desktop
+- [ ] AUR provenance audit: which metadata (orphaned/adopted dates,
+      maintainer history, votes) the AUR RPC actually exposes
 - [ ] Phase 1 exit criteria on Ubuntu (deb) and Fedora (rpm)
 
 ## Resources
