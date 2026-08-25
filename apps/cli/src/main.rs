@@ -80,6 +80,11 @@ enum QuarantineAction {
 }
 
 fn main() {
+    // Behave like a Unix tool when the reader goes away (e.g. `| head`):
+    // die silently on SIGPIPE instead of panicking on a broken pipe.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let exit_code = match cli.command {
         Command::Survey => {
