@@ -337,33 +337,6 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Mini popup window, created hidden; a tray click toggles it.
-    let popup = WebviewWindowBuilder::new(
-        app,
-        tray_place::POPUP_LABEL,
-        WebviewUrl::App("index.html?mode=popup".into()),
-    )
-    .title(tray_place::POPUP_TITLE)
-    .inner_size(360.0, 440.0)
-    .decorations(false)
-    .resizable(false)
-    .skip_taskbar(true)
-    .always_on_top(true)
-    .visible_on_all_workspaces(true)
-    .visible(false)
-    .build()?;
-    let popup_events = popup.clone();
-    popup.on_window_event(move |event| match event {
-        tauri::WindowEvent::CloseRequested { api, .. } => {
-            api.prevent_close();
-            let _ = popup_events.hide();
-        }
-        tauri::WindowEvent::Focused(false) => {
-            let _ = popup_events.hide();
-        }
-        _ => {}
-    });
-
     // Kariba is Linux-only: tauri's tray backend (libappindicator) has no
     // click-event wiring at all, so we own the StatusNotifierItem D-Bus
     // interface directly via ksni and receive real Activate(x, y) events.
@@ -431,17 +404,59 @@ fn toggle_protection(app: &tauri::AppHandle) {
     });
 }
 
-/// Toggle the mini popup. Placement near the cursor is handled by
-/// `tray_place` (compositor-specific; Hyprland via hyprctl).
+/// Toggle the mini popup. The window is created fresh on each open and
+/// destroyed on close/blur: Hyprland window-rule placement is static
+/// (evaluated once when the window opens), so a reused hidden window would
+/// flash at the compositor's default position before any post-show move
+/// lands. Creating per click lets the `tray_place` window rule position it
+/// before it is ever painted.
 fn toggle_popup_xy(app: &tauri::AppHandle, _icon: Option<(f64, f64)>) {
-    let Some(win) = app.get_webview_window(tray_place::POPUP_LABEL) else {
-        return;
-    };
-    if win.is_visible().unwrap_or(false) {
-        let _ = win.hide();
+    if app.get_webview_window(tray_place::POPUP_LABEL).is_some() {
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(win) = handle.get_webview_window(tray_place::POPUP_LABEL) {
+                let _ = win.destroy();
+            }
+        });
         return;
     }
-    let _ = win.show();
-    let _ = win.set_focus();
-    tray_place::place();
+    // Inject the clamped-position window rule before the window exists
+    // (Hyprland applies static rules once, at open time).
+    tray_place::prepare();
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if handle.get_webview_window(tray_place::POPUP_LABEL).is_some() {
+            return;
+        }
+        let Ok(popup) = WebviewWindowBuilder::new(
+            &handle,
+            tray_place::POPUP_LABEL,
+            WebviewUrl::App("index.html?mode=popup".into()),
+        )
+        .title(tray_place::POPUP_TITLE)
+        .inner_size(tray_place::POPUP_W, tray_place::POPUP_H)
+        .decorations(false)
+        .resizable(false)
+        .skip_taskbar(true)
+        .always_on_top(true)
+        .visible_on_all_workspaces(true)
+        .build() else {
+            return;
+        };
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(800));
+            tray_place::log_geometry();
+        });
+        let events = popup.clone();
+        popup.on_window_event(move |event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = events.destroy();
+            }
+            tauri::WindowEvent::Focused(false) => {
+                let _ = events.destroy();
+            }
+            _ => {}
+        });
+    });
 }
