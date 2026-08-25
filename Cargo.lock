@@ -1816,6 +1816,7 @@ dependencies = [
  "kariba-core",
  "kariba-ipc",
  "kariba-survey",
+ "libc",
  "serde_json",
 ]
 
