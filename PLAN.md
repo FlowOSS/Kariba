@@ -478,7 +478,10 @@ be streamed, so karibad copies them to a world-readable scratch dir
 reads the copy); the copy is deleted after. Raising `StreamMaxLength` in
 clamd.conf avoids the copy. INSTREAM responses are NUL-terminated, unlike
 SCAN's newline-terminated replies. The copy approach does not scale to
-very large files — see Known Issues #3.
+very large files — see Known Issues #3 for the decided ladder (raised
+`StreamMaxLength` via Survey, bounded copy, visible skip). Scanning limits
+are industry-standard; immunity comes from landing-scans plus the exec
+gate, not from scanning containers of arbitrary size.
 
 **Known races & gaps.** Between close-write and its async verdict, a
 non-exec read can touch a fresh file; read checks are a soft boundary (an
@@ -972,20 +975,44 @@ Exposed during GUI testing (2026-08-23) — fix before alpha:
    dot on the sidebar tab; the Dashboard status card no longer carries a
    detection list. Still open: desktop notifications and a system tray for
    when the GUI is closed or unfocused.
-3. **Oversized-file scanning is a copy today** — files beyond clamd's
-   `StreamMaxLength` (25 MB default) get copied to `/tmp/kariba-bigscan`
-   and SCAN'd as the copy. Fine at 30 MB, absurd at 100–500 GB (time +
-   disk doubling). Candidate fixes, likely combined:
-   - Raise `StreamMaxLength` in clamd.conf (clamd spools INSTREAM to its
-     TemporaryDirectory, so memory stays bounded; karibad streams bytes as
-     root, so no copy is needed at all) — Survey should hint this.
-   - Hardlink instead of copy when the file's filesystem matches the
-     scratch dir and permissions allow (zero-copy, instant) — useless for
-     mode-700 homes, where the copy exists in the first place.
-   - Reflink copies on CoW filesystems (btrfs/xfs) where supported.
-   - Above a sane cap: don't copy and don't pretend clean — record an
-     explicit "skipped (too large)" verdict in history so coverage gaps
-     are visible, never silent.
+3. **Oversized-file scanning — ladder decided, partially built.** Files
+   beyond clamd's `StreamMaxLength` (25 MB default) are currently copied
+   to `/tmp/kariba-bigscan` and SCAN'd as the copy: fine at 30 MB, absurd
+   at multi-GB. Decided design (2026-08-25):
+   - **Chunked scanning rejected.** Scanning a file in pieces weakens
+     security three ways: signature patterns straddling chunk boundaries
+     match neither piece (overlap mitigates only partially and attackers
+     can aim for seams); container formats (zip/PDF/OLE2) become
+     unparseable fragments, losing archive-depth detection; and "all
+     chunks clean" would cache a partial-scan verdict with whole-scan
+     confidence — an AV that lies about coverage is worse than one that
+     discloses a gap.
+   - **The ladder**: ≤ `StreamMaxLength` → INSTREAM (works everywhere,
+     spool bounded; the primary lever is Survey recommending a raised
+     `StreamMaxLength`, which makes this bucket cover nearly everything).
+     Above it → copy to the scratch dir and SCAN the copy, bounded to a
+     sane cap (~256 MB); above the cap → explicit `skipped (too large)`
+     verdict recorded in history. Skips are visible gaps, never silent
+     cleans. Path-SCAN of oversized originals was considered and dropped:
+     the clamav user cannot read private homes (the security-relevant
+     case), so it only helps on shared storage, where huge files are the
+     least likely to be malware — not worth the rung.
+   - **Why skipping big files is safe**: files are inert. Malware in a
+     huge container must be extracted/written out to act — and whatever
+     lands on disk is scanned at landing regardless of its origin's size.
+     The only bypass is a huge file that is itself executable (vanishingly
+     rare; malware is small and inconspicuous), covered by the exec gate +
+     visible skip. Size limits are industry-standard
+     (ClamAV's own MaxFileSize/MaxScanSize, every commercial AV,
+     VirusTotal's 650 MB cap); immunity comes from landing-scans and the
+     exec gate, not from scanning containers of arbitrary size.
+   - **Survey** should recommend raising `StreamMaxLength` (scaled to RAM,
+     e.g. min(256 MB, ~5% of RAM)), check `MaxThreads` and
+     `TemporaryDirectory` free space, and report which user runs clamd.
+   - **Parked candidate**: overlapped chunk-scanning restricted to
+     oversized *executables* only — the container-parsing weakness doesn't
+     apply to raw ELF/PE, so this is defensible as a targeted fix for the
+     huge-executable edge if it ever matters in practice.
 4. **Catch-up sweeps have no GUI/TUI representation yet** — a running
    sweep is only visible as a `catchup` row in scan history. Needs a
    progress surface and a visible "sweep in progress" state (Dashboard
@@ -1001,7 +1028,14 @@ clients no longer leave scans running).
 
 ## Testing Strategy
 
-- **EICAR** end-to-end tests through the real detection pipeline
+- **EICAR** end-to-end tests through the real detection pipeline. Caveat
+  discovered 2026-08-25: clamd's EICAR signature only matches the bare
+  68-byte string — even ~1 KB of surrounding padding makes clamd return
+  clean (verified directly against clamd via INSTREAM). So EICAR cannot
+  test "malware buried inside a large file"; use it bare. Oversized-ladder
+  rungs are verified mechanically instead (INSTREAM for ≤ StreamMaxLength,
+  observe the scratch copy for the copy rung, timing/no-copy for the skip
+  rung).
 - Integration tests against a mock `clamd` socket
 - Property tests for quarantine invariants (permissions never exceed 000,
   restore round-trips byte-identical)
@@ -1125,6 +1159,49 @@ workspace sits at `0.0.1` (development-only, never released). First public
 builds use prerelease tags (`0.1.0-alpha.1`, `0.1.0-beta.1`); plain
 `0.1.0` lands only when there is an MVP actually worth testing. Packaging
 (item 11) is deliberately deferred until that point.
+
+## Road to 0.1.0 (ClamAV-only MVP)
+
+Scope decision 2026-08-25: ClamAV alone is enough for the first shipped
+builds; the other engines (YARA, rkhunter, AIDE, CrowdSec, Lynis,
+Tetragon) are post-0.1.0. Per the versioning policy above, the first
+public artifact is `0.1.0-alpha.1`; plain `0.1.0` when this list is done.
+
+**Feature gaps (Phase 1 items still open)**
+
+- [ ] System tray: StatusNotifierItem icon with protection state
+      (green/yellow/red), quick actions (quick scan, toggle protection),
+      minimal idle footprint. Phase 1 item 5; the GUI otherwise has no
+      always-on presence.
+- [ ] Desktop notifications on real-time detections (Known Issue #2):
+      detection while the GUI is closed/unfocused is currently silent.
+- [ ] Catch-up sweep visibility (Known Issue #4): a running sweep is only
+      a `catchup` history row; needs a progress surface + "sweep in
+      progress" state.
+- [ ] Quarantine export (Phase 1 item 3 lists restore/delete/export; only
+      restore/delete exist).
+
+**Ship prerequisites**
+
+- [ ] Packaging: systemd unit + OpenRC init script (Next Steps #11) with
+      `Restart=always` supervision and raised `LimitNOFILE`; without it
+      real-time protection dies on logout/reboot and events are lost.
+- [ ] Privilege posture decision for 0.1.0: the root daemon's socket is
+      0666 (any local user can talk to karibad). Either document this as
+      the accepted alpha posture or land a minimal polkit gate.
+- [ ] CI: GitHub Actions — build, clippy, cargo test, and the EICAR
+      end-to-end test against a mock clamd socket.
+- [ ] Performance evaluation harness (this document, Testing Strategy):
+      A/B with protection off vs on, burst + trickle workloads, exec-gate
+      latency percentiles, low-end target — measured before we ask anyone
+      to run this on their machine.
+- [ ] Release mechanics: bump to `0.1.0-alpha.1`, tag, changelog, push to
+      `FlowOSS/kariba` (Next Steps #12).
+
+**Explicitly deferred (post-0.1.0)**
+
+- All non-ClamAV engines; full polkit; parallel scanning (Known Issue #1,
+  revisit if measured throughput is unacceptable on low-end hardware).
 
 ## Assumptions to Verify
 
