@@ -11,6 +11,7 @@ use std::time::Duration;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod tray_ksni;
+mod tray_place;
 
 fn connect() -> Result<Client, String> {
     kariba_ipc::connect_daemon().map_err(|e| {
@@ -253,7 +254,6 @@ fn main() {
 
 // --- System tray -----------------------------------------------------------
 
-const POPUP_LABEL: &str = "popup";
 const MAIN_LABEL: &str = "main";
 const QUICK_PATHS: &[&str] = &["~/Downloads", "/tmp", "/var/tmp"];
 // A detection younger than this keeps the tray red.
@@ -340,10 +340,10 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // Mini popup window, created hidden; a tray click toggles it.
     let popup = WebviewWindowBuilder::new(
         app,
-        POPUP_LABEL,
+        tray_place::POPUP_LABEL,
         WebviewUrl::App("index.html?mode=popup".into()),
     )
-    .title("Kariba Panel")
+    .title(tray_place::POPUP_TITLE)
     .inner_size(360.0, 440.0)
     .decorations(false)
     .resizable(false)
@@ -431,70 +431,17 @@ fn toggle_protection(app: &tauri::AppHandle) {
     });
 }
 
-/// Toggle the mini popup. `icon` is the tray icon's center in screen
-/// coordinates (ksni delivers them with Activate). set_position covers
-/// compositors that honor position requests; Hyprland ignores them, so the
-/// window is also moved into place via hyprctl after mapping.
-fn toggle_popup_xy(app: &tauri::AppHandle, icon: Option<(f64, f64)>) {
-    let Some(win) = app.get_webview_window(POPUP_LABEL) else {
+/// Toggle the mini popup. Placement near the cursor is handled by
+/// `tray_place` (compositor-specific; Hyprland via hyprctl).
+fn toggle_popup_xy(app: &tauri::AppHandle, _icon: Option<(f64, f64)>) {
+    let Some(win) = app.get_webview_window(tray_place::POPUP_LABEL) else {
         return;
     };
     if win.is_visible().unwrap_or(false) {
         let _ = win.hide();
         return;
     }
-    position_popup_at(&win, icon);
     let _ = win.show();
     let _ = win.set_focus();
-    hyprland_place(&win, icon);
-}
-
-fn position_popup_at(win: &tauri::WebviewWindow, icon_center: Option<(f64, f64)>) {
-    let Some((x, y)) = icon_center.map(|(cx, cy)| popup_target(win, cx, cy)) else {
-        return;
-    };
-    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
-}
-
-/// Where the 360x440 popup should land for a tray icon at (cx, cy):
-/// centered above the icon, or below it when there's no room above.
-fn popup_target(win: &tauri::WebviewWindow, cx: f64, cy: f64) -> (f64, f64) {
-    const PW: f64 = 360.0;
-    const PH: f64 = 440.0;
-    let monitor = win
-        .current_monitor()
-        .ok()
-        .flatten()
-        .map(|m| (m.size().width as f64, m.size().height as f64));
-    let (mw, mh) = monitor.unwrap_or((1920.0, 1080.0));
-    let x = (cx - PW / 2.0).clamp(0.0, (mw - PW).max(0.0));
-    let mut y = cy - PH - 12.0;
-    if y < 0.0 {
-        y = (cy + 36.0).min((mh - PH).max(0.0));
-    }
-    (x, y)
-}
-
-/// Hyprland ignores xdg-toplevel position requests (wlroots has no standard
-/// positioning protocol for regular toplevels), so after the window is
-/// mapped we focus it by title and move it with hyprctl. Runs on a thread
-/// with a small delay so the window is mapped first; no-ops on
-/// non-Hyprland compositors.
-fn hyprland_place(win: &tauri::WebviewWindow, icon: Option<(f64, f64)>) {
-    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
-        return;
-    }
-    let Some((cx, cy)) = icon else {
-        return;
-    };
-    let (x, y) = popup_target(win, cx, cy);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(250));
-        let batch =
-            format!("dispatch focuswindow title:^Kariba Panel$ ; dispatch movewindow [{x};{y}]");
-        let _ = std::process::Command::new("hyprctl")
-            .arg("--batch")
-            .arg(batch)
-            .output();
-    });
+    tray_place::place();
 }
