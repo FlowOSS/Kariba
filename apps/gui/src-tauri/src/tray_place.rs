@@ -44,21 +44,38 @@ fn place_inner() -> Result<(), String> {
 
     let addr = popup_address()?;
 
-    // `float` with action "set" (a toggle would un-float an already
-    // floating window), then `move` to the computed spot. Both target the
-    // popup by address, so they don't depend on focus.
+    // Hyprland's float dispatcher TOGGLES regardless of the action value,
+    // so only dispatch it when the popup isn't floating yet (otherwise it
+    // would un-float it). Then `move` to the computed spot. Both target the
+    // popup by address, so they don't depend on focus. Note the literal
+    // `)` closing each Lua call sits after the `}}` table-close.
+    if !is_floating_by_addr(&addr)? {
+        dispatch_lua(&format!(
+            r#"hl.dsp.window.float({{ action = "set", window = "address:{addr}" }})"#
+        ))?;
+        std::thread::sleep(Duration::from_millis(150));
+    }
     dispatch_lua(&format!(
-        r#"hl.dsp.window.float({{ action = "set", window = "address:{addr}" }}"#
-    ))?;
-    std::thread::sleep(Duration::from_millis(150));
-    dispatch_lua(&format!(
-        r#"hl.dsp.window.move({{ x = {x}, y = {y}, relative = false, window = "address:{addr}" }}"#
+        r#"hl.dsp.window.move({{ x = {x}, y = {y}, relative = false, window = "address:{addr}" }})"#
     ))?;
 
     log(&format!(
         "moved popup to ({x}, {y}) near cursor ({cx}, {cy})"
     ));
     Ok(())
+}
+
+/// Whether the window with this address is currently floating.
+fn is_floating_by_addr(addr: &str) -> Result<bool, String> {
+    let out = hyprctl(&["clients", "-j"])?;
+    let clients: Vec<serde_json::Value> =
+        serde_json::from_str(&out).map_err(|e| format!("bad clients json: {e}"))?;
+    for c in &clients {
+        if c.get("address").and_then(|a| a.as_str()) == Some(addr) {
+            return Ok(c.get("floating").and_then(|f| f.as_bool()).unwrap_or(false));
+        }
+    }
+    Err(format!("window {addr} vanished"))
 }
 
 /// Target top-left for the popup given the cursor and its monitor bounds:
