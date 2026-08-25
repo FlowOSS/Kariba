@@ -1863,6 +1863,7 @@ name = "kariba-survey"
 version = "0.0.1"
 dependencies = [
  "kariba-core",
+ "libc",
  "serde",
  "tempfile",
 ]

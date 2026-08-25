@@ -19,6 +19,7 @@ pub fn check(distro: &Distro, init: InitSystem) -> Vec<CheckResult> {
     check_service(distro, init, &mut results);
     check_socket(&mut results);
     check_database(distro, &mut results);
+    check_config_tuning(init, &mut results);
     results
 }
 
@@ -143,6 +144,122 @@ fn query_version(stream: &mut UnixStream) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..n]).trim().to_string())
 }
 
+/// clamd.conf tuning advice (PLAN.md Known Issues #3): StreamMaxLength
+/// drives how much karibad can stream per file; MaxThreads our usable
+/// concurrency; TemporaryDirectory must hold the spool.
+fn check_config_tuning(init: InitSystem, results: &mut Vec<CheckResult>) {
+    let Ok(content) = fs::read_to_string(clamav::CLAMD_CONF) else {
+        results.push(warn(
+            "clamd tuning",
+            format!("{} not found; cannot verify tuning", clamav::CLAMD_CONF),
+            None,
+        ));
+        return;
+    };
+    let restart = restart_cmd(init);
+    let recommended = recommended_stream_max();
+
+    match clamav::stream_max_length_from_config(&content) {
+        Some(value) if value >= recommended => {
+            results.push(ok(
+                "StreamMaxLength",
+                format!("{} ({} needed)", mb(value), mb(recommended)),
+            ));
+        }
+        Some(value) => {
+            results.push(warn(
+                "StreamMaxLength",
+                format!("{} is low ({} recommended)", mb(value), mb(recommended)),
+                Some(format!(
+                    "set 'StreamMaxLength {}M' in {} and restart clamd ({restart})",
+                    recommended / (1024 * 1024),
+                    clamav::CLAMD_CONF
+                )),
+            ));
+        }
+        None => {
+            results.push(warn(
+                "StreamMaxLength",
+                format!(
+                    "not set (clamd default {} MB, {} recommended)",
+                    clamav::DEFAULT_STREAM_MAX / (1024 * 1024),
+                    mb(recommended)
+                ),
+                Some(format!(
+                    "add 'StreamMaxLength {}M' to {} and restart clamd ({restart})",
+                    recommended / (1024 * 1024),
+                    clamav::CLAMD_CONF
+                )),
+            ));
+        }
+    }
+
+    match clamav::max_threads_from_config(&content) {
+        Some(threads) if threads < MIN_THREADS => {
+            results.push(warn(
+                "MaxThreads",
+                format!("{threads} is low for real-time scanning"),
+                Some(format!(
+                    "set 'MaxThreads {MIN_THREADS}' in {} and restart clamd ({restart})",
+                    clamav::CLAMD_CONF
+                )),
+            ));
+        }
+        Some(threads) => {
+            results.push(ok("MaxThreads", format!("{threads}")));
+        }
+        None => {
+            results.push(ok("MaxThreads", "not set (clamd default 10)".to_string()));
+        }
+    }
+
+    let dir = clamav::temporary_directory_from_config(&content).unwrap_or_else(|| "/tmp".into());
+    if let (Some(free), true) = (free_bytes(Path::new(&dir)), recommended > 0)
+        && free < recommended
+    {
+        results.push(warn(
+            "TemporaryDirectory",
+            format!(
+                "{dir} has {} free, less than the {} INSTREAM spool needs",
+                mb(free),
+                mb(recommended)
+            ),
+            Some("free space or point TemporaryDirectory at a larger disk".into()),
+        ));
+    }
+}
+
+/// Recommended StreamMaxLength: ~5% of RAM, clamped to 32 MB..256 MB.
+fn recommended_stream_max() -> u64 {
+    const MIN: u64 = 32 * 1024 * 1024;
+    const MAX: u64 = 256 * 1024 * 1024;
+    let ram = kariba_core::system::total_ram_bytes().unwrap_or(8 * 1024 * 1024 * 1024);
+    (ram / 20).clamp(MIN, MAX)
+}
+
+fn restart_cmd(init: InitSystem) -> String {
+    match init {
+        InitSystem::Systemd => "sudo systemctl restart clamav-daemon".into(),
+        InitSystem::OpenRc => "sudo rc-service clamd restart".into(),
+        _ => "restart the clamd service".into(),
+    }
+}
+
+fn mb(bytes: u64) -> String {
+    format!("{} MB", bytes / (1024 * 1024))
+}
+
+fn free_bytes(path: &Path) -> Option<u64> {
+    let c_path = std::ffi::CString::new(path.to_str()?).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+const MIN_THREADS: u64 = 8;
+
 fn check_database(distro: &Distro, results: &mut Vec<CheckResult>) {
     let daily = match clamav::daily_db_file() {
         Some(daily) => daily,
@@ -233,5 +350,24 @@ mod tests {
         let distro = kariba_core::detect_distro();
         let results = check(&distro, kariba_core::detect_init());
         assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn recommended_stream_max_is_clamped() {
+        let rec = recommended_stream_max();
+        assert!(rec >= 32 * 1024 * 1024);
+        assert!(rec <= 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn restart_cmd_per_init() {
+        assert_eq!(
+            restart_cmd(InitSystem::Systemd),
+            "sudo systemctl restart clamav-daemon"
+        );
+        assert_eq!(
+            restart_cmd(InitSystem::OpenRc),
+            "sudo rc-service clamd restart"
+        );
     }
 }

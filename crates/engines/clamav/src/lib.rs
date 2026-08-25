@@ -10,15 +10,38 @@ use std::time::{Duration, Instant};
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(3);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const INSTREAM_CHUNK: usize = 64 * 1024;
-// clamd's default StreamMaxLength; larger files fall back to a path-based
-// SCAN of a readable copy (see bigscan_copy).
-const STREAM_MAX: u64 = 25 * 1024 * 1024;
+// Files up to clamd's StreamMaxLength (read from clamd.conf at connect
+// time, 25 MB default) are streamed via INSTREAM. Above that, files are
+// copied to a readable scratch dir and path-SCAN'd, but only up to this
+// cap — beyond it the file is reported Skipped (a visible coverage gap),
+// never copied. See PLAN.md Known Issues #3 for the decision.
+const BIGSCAN_COPY_CAP: u64 = 256 * 1024 * 1024;
 // World-readable scratch for oversized copies: karibad (root) can read any
 // file, but clamd runs as the unprivileged `clamav` user and cannot enter
 // mode-700 homes, so path-based SCAN of the original would EACCES there.
 const BIGSCAN_DIR: &str = "/tmp/kariba-bigscan";
 
 static BIGSCAN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How a file reaches clamd (PLAN.md Known Issues #3): stream contents up
+/// to clamd's StreamMaxLength; above it, SCAN a readable copy, bounded by
+/// BIGSCAN_COPY_CAP; beyond that, a visible skip — never copy multi-GB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ladder {
+    Instream,
+    Copy,
+    Skip,
+}
+
+fn ladder_for(len: u64, stream_max: u64) -> Ladder {
+    if len <= stream_max {
+        Ladder::Instream
+    } else if len <= BIGSCAN_COPY_CAP {
+        Ladder::Copy
+    } else {
+        Ladder::Skip
+    }
+}
 
 /// Copy an oversized file somewhere clamd can read. The copy is mode 0644
 /// regardless of the original's permissions; the caller deletes it after.
@@ -41,6 +64,8 @@ pub enum ScanOutcome {
     Clean,
     Infected { signature: String },
     Error { message: String },
+    // Not scanned at all — a visible coverage gap, never a clean verdict.
+    Skipped { reason: String },
 }
 
 pub struct ClamdClient {
@@ -48,6 +73,8 @@ pub struct ClamdClient {
     stream: UnixStream,
     last_command: Instant,
     read_timeout: Duration,
+    // Effective clamd StreamMaxLength, read from clamd.conf at connect.
+    stream_max: u64,
 }
 
 impl ClamdClient {
@@ -76,6 +103,7 @@ impl ClamdClient {
                         stream,
                         last_command: Instant::now(),
                         read_timeout,
+                        stream_max: clamav::stream_max_length(),
                     });
                 }
                 Err(e) => last_error = Some(e),
@@ -117,21 +145,25 @@ impl ClamdClient {
         if self.last_command.elapsed() > KEEPALIVE_AFTER {
             self.keepalive()?;
         }
-        // Stream the file contents to clamd (INSTREAM) instead of sending
-        // the path: karibad runs as root and can open anything, while clamd
-        // runs as the unprivileged `clamav` user, which cannot traverse
-        // mode-700 home directories. Files beyond clamd's StreamMaxLength
-        // can't be streamed, so they are copied to a world-readable scratch
-        // path and scanned there (path-based SCAN of the original would
-        // fail with EACCES inside private homes).
+        // Ladder (PLAN.md Known Issues #3): stream the file contents to
+        // clamd (INSTREAM) up to its StreamMaxLength — karibad runs as root
+        // and can open anything, while clamd runs as the unprivileged
+        // `clamav` user, which cannot traverse mode-700 home directories.
+        // Above the limit, copy to a readable scratch path and SCAN the
+        // copy, bounded by BIGSCAN_COPY_CAP; beyond that, report a visible
+        // skip instead of copying multi-GB files.
         let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let outcome = if len <= STREAM_MAX {
-            self.instream(path)
-        } else {
-            let copy = bigscan_copy(path)?;
-            let outcome = self.scan_command(&copy);
-            let _ = fs::remove_file(&copy);
-            outcome
+        let outcome = match ladder_for(len, self.stream_max) {
+            Ladder::Instream => self.instream(path),
+            Ladder::Copy => {
+                let copy = bigscan_copy(path)?;
+                let outcome = self.scan_command(&copy);
+                let _ = fs::remove_file(&copy);
+                outcome
+            }
+            Ladder::Skip => Ok(ScanOutcome::Skipped {
+                reason: format!("too large ({} bytes)", len),
+            }),
         };
         self.last_command = Instant::now();
         outcome
@@ -207,6 +239,32 @@ pub fn parse_scan_response(line: &str) -> ScanOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ladder_boundaries() {
+        let stream_max = 25 * 1024 * 1024;
+        // At or under StreamMaxLength: stream.
+        assert_eq!(ladder_for(0, stream_max), Ladder::Instream);
+        assert_eq!(ladder_for(stream_max, stream_max), Ladder::Instream);
+        // Above StreamMaxLength, at/under the copy cap: copy.
+        assert_eq!(ladder_for(stream_max + 1, stream_max), Ladder::Copy);
+        assert_eq!(ladder_for(BIGSCAN_COPY_CAP, stream_max), Ladder::Copy);
+        // Over the copy cap: visible skip, never a multi-GB copy.
+        assert_eq!(ladder_for(BIGSCAN_COPY_CAP + 1, stream_max), Ladder::Skip);
+        assert_eq!(
+            ladder_for(500 * 1024 * 1024 * 1024, stream_max),
+            Ladder::Skip
+        );
+    }
+
+    #[test]
+    fn ladder_respects_configured_stream_max() {
+        // A raised StreamMaxLength pulls files out of the copy rung. Keep
+        // it below the copy cap so the copy rung still has room.
+        let raised = 100 * 1024 * 1024;
+        assert_eq!(ladder_for(50 * 1024 * 1024, raised), Ladder::Instream);
+        assert_eq!(ladder_for(raised + 1, raised), Ladder::Copy);
+    }
 
     #[test]
     fn parses_clean() {

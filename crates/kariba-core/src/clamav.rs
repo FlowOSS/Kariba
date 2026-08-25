@@ -71,6 +71,66 @@ pub fn db_dir_from_config(content: &str) -> Option<String> {
     None
 }
 
+/// First uncommented value of `name` in clamd.conf content; the character
+/// after the directive name must be whitespace (so `MaxThreads` doesn't
+/// match a hypothetical `MaxThreadsFoo`).
+fn directive_value<'a>(content: &'a str, name: &str) -> Option<&'a str> {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(name)
+            && rest.starts_with(char::is_whitespace)
+        {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// Parse clamd byte values: plain number or K/M/G suffix (KB/MB/GB too).
+pub fn parse_size_value(value: &str) -> Option<u64> {
+    let v = value.trim().trim_end_matches(['B', 'b']).trim();
+    let (num, multiplier) = match v.chars().next_back() {
+        Some('G' | 'g') => (&v[..v.len() - 1], 1024 * 1024 * 1024),
+        Some('M' | 'm') => (&v[..v.len() - 1], 1024 * 1024),
+        Some('K' | 'k') => (&v[..v.len() - 1], 1024),
+        _ => (v, 1),
+    };
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.saturating_mul(multiplier))
+}
+
+pub fn stream_max_length_from_config(content: &str) -> Option<u64> {
+    directive_value(content, "StreamMaxLength").and_then(parse_size_value)
+}
+
+pub fn max_threads_from_config(content: &str) -> Option<u64> {
+    directive_value(content, "MaxThreads").and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+pub fn temporary_directory_from_config(content: &str) -> Option<String> {
+    directive_value(content, "TemporaryDirectory").map(|v| v.trim().to_string())
+}
+
+/// The effective `StreamMaxLength`: configured value, or clamd's 25 MB
+/// default. karibad streams files up to this size and falls back to the
+/// copy/skip ladder above it (PLAN.md, Known Issues #3).
+pub fn stream_max_length() -> u64 {
+    fs::read_to_string(CLAMD_CONF)
+        .ok()
+        .and_then(|content| stream_max_length_from_config(&content))
+        .unwrap_or(DEFAULT_STREAM_MAX)
+}
+
+pub const DEFAULT_STREAM_MAX: u64 = 25 * 1024 * 1024;
+
 pub fn daily_db_file() -> Option<(PathBuf, SystemTime)> {
     daily_db_file_in(&db_dir())
 }
@@ -116,6 +176,48 @@ mod tests {
     fn parses_db_dir_from_config() {
         let content = "DatabaseDirectory /var/lib/clamav\n";
         assert_eq!(db_dir_from_config(content), Some("/var/lib/clamav".into()));
+    }
+
+    #[test]
+    fn parses_stream_max_length_suffixes() {
+        assert_eq!(
+            stream_max_length_from_config("StreamMaxLength 25M\n"),
+            Some(25 * 1024 * 1024)
+        );
+        assert_eq!(
+            stream_max_length_from_config("StreamMaxLength 1G\n"),
+            Some(1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            stream_max_length_from_config("StreamMaxLength 512KB\n"),
+            Some(512 * 1024)
+        );
+        assert_eq!(
+            stream_max_length_from_config("StreamMaxLength 26214400\n"),
+            Some(26_214_400)
+        );
+        assert_eq!(
+            stream_max_length_from_config("StreamMaxLength 256 M\n"),
+            Some(256 * 1024 * 1024)
+        );
+        assert_eq!(stream_max_length_from_config("#StreamMaxLength 1G\n"), None);
+        assert_eq!(stream_max_length_from_config("MaxThreads 12\n"), None);
+    }
+
+    #[test]
+    fn parses_max_threads() {
+        assert_eq!(max_threads_from_config("MaxThreads 12\n"), Some(12));
+        assert_eq!(max_threads_from_config("#MaxThreads 12\n"), None);
+        assert_eq!(max_threads_from_config("MaxThreadsX 12\n"), None);
+    }
+
+    #[test]
+    fn parses_temporary_directory() {
+        assert_eq!(
+            temporary_directory_from_config("TemporaryDirectory /var/tmp\n"),
+            Some("/var/tmp".into())
+        );
+        assert_eq!(temporary_directory_from_config(""), None);
     }
 
     #[test]

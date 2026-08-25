@@ -916,6 +916,12 @@ impl Shared {
                 queue.push_scan(path.to_path_buf(), Lane::Exec);
                 true
             }
+            Some(ScanOutcome::Skipped { reason }) => {
+                // Oversized executable: nothing to re-queue (a re-scan would
+                // skip again). Fail open, loudly.
+                self.note_error(path, &format!("verdict skipped: {reason}; allowing"));
+                true
+            }
             None => {
                 self.note_error(path, "verdict over budget; allowing");
                 queue.push_scan(path.to_path_buf(), Lane::Exec);
@@ -970,6 +976,10 @@ impl Shared {
             }
             Ok(ScanOutcome::Error { message }) => {
                 self.note_error(path, &message);
+            }
+            Ok(ScanOutcome::Skipped { reason }) => {
+                // Visible coverage gap, rate-limited per path by note_error.
+                self.note_error(path, &format!("skipped: {reason}"));
             }
             // The file vanished between queueing and scanning (writer
             // deleted it) — a harmless race, not an engine failure.

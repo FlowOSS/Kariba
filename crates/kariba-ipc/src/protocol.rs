@@ -245,6 +245,9 @@ pub struct ScanResult {
     pub threats_found: u32,
     pub quarantined: u32,
     pub duration_ms: u64,
+    // Files not scanned at all (oversized) — a visible coverage gap.
+    #[serde(default)]
+    pub skipped: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

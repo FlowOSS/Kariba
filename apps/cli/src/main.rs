@@ -166,8 +166,16 @@ fn main() {
                 println!();
             }
             println!(
-                "scanned {} files in {}ms · {} threat(s) found · {} quarantined",
-                result.files_scanned, result.duration_ms, result.threats_found, result.quarantined
+                "scanned {} files in {}ms · {} threat(s) found · {} quarantined{}",
+                result.files_scanned,
+                result.duration_ms,
+                result.threats_found,
+                result.quarantined,
+                if result.skipped > 0 {
+                    format!(" · {} skipped (too large)", result.skipped)
+                } else {
+                    String::new()
+                }
             );
             Ok(if result.threats_found > 0 { 2 } else { 0 })
         }) {

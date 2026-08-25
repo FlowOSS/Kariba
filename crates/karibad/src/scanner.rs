@@ -125,6 +125,7 @@ pub fn run_scan(
     let mut files_scanned: u64 = 0;
     let mut threats_found: u32 = 0;
     let mut quarantined: u32 = 0;
+    let mut skipped: u32 = 0;
     let mut cancelled = cancel.load(Ordering::Relaxed);
 
     for entry in FileWalker::new(params.paths.clone(), skip, &policy.exclusions) {
@@ -184,6 +185,12 @@ pub fn run_scan(
             }
             Ok(ScanOutcome::Clean) => {}
             Ok(ScanOutcome::Error { .. }) => {}
+            Ok(ScanOutcome::Skipped { reason }) => {
+                // Visible coverage gap (oversized file), never a clean
+                // verdict; PLAN.md Known Issues #3.
+                skipped += 1;
+                eprintln!("karibad: scan: skipped {} ({reason})", entry.display());
+            }
             Err(e) => {
                 if let Ok(mut active) = active_scans.lock() {
                     active.remove(&scan_id);
@@ -216,6 +223,9 @@ pub fn run_scan(
     if let Ok(mut active) = active_scans.lock() {
         active.remove(&scan_id);
     }
+    if skipped > 0 {
+        eprintln!("karibad: scan: {skipped} file(s) skipped as too large (see log)");
+    }
     let status = if cancelled { "cancelled" } else { "completed" };
     lock_db(db)?.finish_scan(scan_id, files_scanned, threats_found, status);
 
@@ -225,6 +235,7 @@ pub fn run_scan(
         threats_found,
         quarantined,
         duration_ms: started.elapsed().as_millis() as u64,
+        skipped,
     })
 }
 
