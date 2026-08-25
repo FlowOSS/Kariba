@@ -807,7 +807,17 @@ impl Shared {
         };
         match c.scan_path(path) {
             Ok(ScanOutcome::Infected { signature }) => {
-                self.cache_put(key, Verdict::Infected(signature.clone()));
+                // Check-and-set dedup: concurrent scans of the same file
+                // version (e.g. open-check + close-write racing) must
+                // produce exactly one detection. First one wins.
+                {
+                    let mut cache = self.cache.lock().unwrap();
+                    if matches!(cache.get(&key), Some(Verdict::Infected(_))) {
+                        return;
+                    }
+                    cache.insert(key, Verdict::Infected(signature.clone()));
+                }
+                self.cache_dirty.store(true, Ordering::Relaxed);
                 self.handle_detection(path, &signature, "detected");
             }
             Ok(ScanOutcome::Clean) => {
@@ -893,6 +903,11 @@ impl Shared {
     // the daemon log spell out the outcome — detection itself always happens
     // when real-time is on; quarantine is only one possible response.
     fn handle_detection(&self, path: &Path, signature: &str, kind: &str) {
+        // Gone by the time we act: already handled by a racing scan or
+        // deleted by the writer. Nothing to record or quarantine.
+        if fs::metadata(path).is_err() {
+            return;
+        }
         self.detections.fetch_add(1, Ordering::Relaxed);
         let sha256 = sha256_file(path).unwrap_or_default();
         let path_display = path.display().to_string();
@@ -911,21 +926,29 @@ impl Shared {
         };
 
         let mut quarantined = false;
-        if self.auto_quarantine
-            && let Ok(q) = self.quarantine.put(threat_id, path)
-        {
-            let Ok(mut db) = self.db.lock() else {
-                return;
-            };
-            db.set_threat_status(threat_id, "quarantined");
-            db.insert_quarantine(
-                threat_id,
-                &path_display,
-                &q.blob_path.display().to_string(),
-                q.original_mode,
-                q.size,
-            );
-            quarantined = true;
+        if self.auto_quarantine {
+            match self.quarantine.put(threat_id, path) {
+                Ok(q) => {
+                    let Ok(mut db) = self.db.lock() else {
+                        return;
+                    };
+                    db.set_threat_status(threat_id, "quarantined");
+                    db.insert_quarantine(
+                        threat_id,
+                        &path_display,
+                        &q.blob_path.display().to_string(),
+                        q.original_mode,
+                        q.size,
+                    );
+                    quarantined = true;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "karibad: real-time: quarantine failed for {}: {e}",
+                        path_display
+                    );
+                }
+            }
         }
 
         let action = match (kind, quarantined) {
