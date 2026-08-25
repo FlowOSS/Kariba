@@ -49,7 +49,7 @@ const VERDICT_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_TIMEOUT_MS: i32 = 500;
 const ENGINE: &str = "ClamAV";
-const CACHE_CAP: usize = 10_000;
+const CACHE_CAP: usize = 100_000;
 const WORKERS: usize = 4;
 // In-memory queue cap; beyond it paths spill to SQLite, so coverage is
 // preserved without unbounded RAM.
@@ -497,6 +497,14 @@ struct ChurnEntry {
     dirty: bool,
 }
 
+/// Drain-rate measurement window: starts when the backlog goes high, so
+/// ETA reflects actual drain throughput instead of the lifetime average
+/// (which is dominated by idle trickle periods and wildly overestimates).
+struct RateWindow {
+    since: Instant,
+    scans_at_start: u64,
+}
+
 /// State shared between the intake thread and the scan workers.
 struct Shared {
     exclusions: Exclusions,
@@ -526,6 +534,7 @@ struct Shared {
     detections: AtomicU32,
     started: Instant,
     had_backlog: AtomicBool,
+    rate_window: Mutex<Option<RateWindow>>,
 }
 
 impl Shared {
@@ -573,11 +582,15 @@ impl Shared {
             detections: AtomicU32::new(0),
             started: Instant::now(),
             had_backlog: AtomicBool::new(false),
+            rate_window: Mutex::new(None),
         }
     }
 
-    /// Progress line every PROGRESS_STEP scans with backlog, rate and ETA;
-    /// a one-shot "backlog drained" line when a real backlog empties out.
+    /// Progress line every PROGRESS_STEP scans with backlog, rate and ETA.
+    /// ETA uses the busy-window drain rate (clock starts when the backlog
+    /// goes high): the lifetime average is misleading because idle trickle
+    /// periods measure arrival rate (~files/s the system opens), not scan
+    /// capacity. A one-shot "backlog drained" line closes each episode.
     fn progress_tick(&self, queue: &ScanQueue) {
         let n = self.files_scanned.fetch_add(1, Ordering::Relaxed) + 1;
         if !n.is_multiple_of(PROGRESS_STEP) {
@@ -587,17 +600,39 @@ impl Shared {
         if backlog > BACKLOG_HIGH {
             self.had_backlog.store(true, Ordering::Relaxed);
         }
-        let secs = self.started.elapsed().as_secs().max(1);
+        let mut window = self.rate_window.lock().unwrap();
         if backlog == 0 && self.had_backlog.swap(false, Ordering::Relaxed) {
+            let secs = self.started.elapsed().as_secs().max(1);
+            *window = None;
             eprintln!("karibad: real-time: backlog drained ({n} scanned in {secs}s)");
             return;
         }
-        let rate = n / secs;
-        let eta = backlog.checked_div(rate).unwrap_or(backlog);
-        eprintln!(
-            "karibad: real-time: {n} scanned, backlog {backlog}, ~{rate}/s, ETA {}",
-            fmt_eta(eta)
-        );
+        if backlog >= BACKLOG_HIGH {
+            let w = window.get_or_insert(RateWindow {
+                since: Instant::now(),
+                scans_at_start: n,
+            });
+            let elapsed = w.since.elapsed().as_secs();
+            if elapsed >= 2 && n > w.scans_at_start {
+                let rate = ((n - w.scans_at_start) / elapsed).max(1);
+                let eta = backlog / rate;
+                eprintln!(
+                    "karibad: real-time: {n} scanned, backlog {backlog}, ~{rate}/s, ETA {}",
+                    fmt_eta(eta)
+                );
+            } else {
+                eprintln!(
+                    "karibad: real-time: {n} scanned, backlog {backlog}, measuring drain rate"
+                );
+            }
+        } else {
+            // Trickle: small backlog, no meaningful ETA; lifetime rate is
+            // fine as an "activity" number here.
+            *window = None;
+            let secs = self.started.elapsed().as_secs().max(1);
+            let rate = n / secs;
+            eprintln!("karibad: real-time: {n} scanned, backlog {backlog}, ~{rate}/s");
+        }
     }
 
     fn cache_lookup(&self, key: &CacheKey) -> Option<Verdict> {
@@ -607,7 +642,14 @@ impl Shared {
     fn cache_put(&self, key: CacheKey, verdict: Verdict) {
         let mut cache = self.cache.lock().unwrap();
         if cache.len() >= CACHE_CAP {
-            cache.clear();
+            // Evict an arbitrary half, never the whole cache: a full clear
+            // causes system-wide re-check waves (seen live: waybar scripts
+            // re-scanned after read-check verdicts crossed the cap).
+            let excess = cache.len() - CACHE_CAP / 2;
+            let victims: Vec<CacheKey> = cache.keys().take(excess).cloned().collect();
+            for key in victims {
+                cache.remove(&key);
+            }
         }
         cache.insert(key, verdict);
         drop(cache);
