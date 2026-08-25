@@ -351,6 +351,21 @@ exec verdict); a file scanned once is never scanned again until it changes.
 sha256 is computed only on detection (threat records), keeping the hot path
 at stat + hashmap lookup.
 
+**Verdict cache sizing.** The cache is RAM-budgeted, never pre-allocated:
+it fills only as verdicts appear, so unused budget costs nothing.
+`realtime.cache_cap_mb = 0` (default) auto-sizes to
+`realtime.cache_auto_percent` of total RAM (default 0.2%, 8 MB floor) —
+bigger machines spend spare RAM to avoid re-scan CPU, small machines scale
+down automatically. `cache_cap_mb > 0` pins a fixed size; the GUI offers
+both modes with a toggle, shows the computed auto value, warns (without
+blocking) on values above total RAM, and resets either side to defaults.
+Budget enforcement is size-based: average serialized entry size is
+measured from the actual cache file (bytes ÷ entries), converted to a RAM
+estimate (×1.5), and overflow evicts an arbitrary half — never the whole
+cache (a full clear causes system-wide re-check waves). The startup log
+states the loaded size and the budget derivation; `status` carries
+`total_ram_mb` so clients can show/validate sizing.
+
 **Triage — risk-based lanes.** Not every file deserves equal urgency:
 executables are the only class that can act on their own, so they are
 prioritized; media is inert until something consumes it, so it yields
@@ -826,6 +841,8 @@ enabled = true            # master switch; fanotify slice reads this
 auto_quarantine = true
 scan_on_open = true       # cache-first FAN_OPEN read checks (Phase B)
 auto_catchup = true       # auto catch-up sweep on visibility loss (Phase B)
+cache_cap_mb = 0          # verdict cache cap; 0 = auto, >0 = fixed MB
+cache_auto_percent = 0.2  # % of total RAM used when cache_cap_mb = 0
 
 [scan]
 default_quarantine = true # applies when a client sends no explicit choice
@@ -833,6 +850,7 @@ default_quarantine = true # applies when a client sends no explicit choice
 [exclusions]
 paths = ["/proc", "/sys", "/dev", "/run"]   # prefix match
 extensions = []                              # "*.iso" patterns, case-insensitive
+gate_paths = ["/usr", "/boot"]               # exec-gate-only exclusions
 ```
 
 **RPC** — `settings.get` returns the whole document; `settings.set` accepts

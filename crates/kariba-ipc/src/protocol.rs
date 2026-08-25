@@ -257,6 +257,10 @@ pub struct StatusResult {
     pub protection_enabled: bool,
     pub realtime_active: bool,
     pub realtime_detail: String,
+    // Total system RAM in MB; the GUI uses it to show/validate the
+    // verdict-cache sizing. 0 when the daemon couldn't determine it.
+    #[serde(default)]
+    pub total_ram_mb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

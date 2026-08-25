@@ -183,6 +183,9 @@ fn dispatch(
                 protection_enabled,
                 realtime_active,
                 realtime_detail,
+                total_ram_mb: kariba_core::system::total_ram_bytes()
+                    .map(|b| b / (1024 * 1024))
+                    .unwrap_or(0),
             })
             .map_err(server_err)
         }
@@ -422,6 +425,15 @@ fn normalize_settings(settings: &mut Settings) -> Result<(), RpcError> {
         }
     }
     settings.exclusions.gate_paths = gate_paths;
+
+    // Verdict-cache auto-allocation percent must be sane; the fixed MB cap
+    // is intentionally uncapped (power users / big machines), the GUI warns.
+    let percent = settings.realtime.cache_auto_percent;
+    if percent <= 0.0 || percent > 5.0 {
+        return Err(invalid_params(format!(
+            "realtime.cache_auto_percent must be > 0 and <= 5 (got {percent})"
+        )));
+    }
 
     Ok(())
 }

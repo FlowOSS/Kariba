@@ -15,6 +15,39 @@
   let confirmDisable = $state(false);
   let removeTarget = $state<string | null>(null);
 
+  // Verdict cache sizing.
+  let totalRamMb = $state(0);
+  let autoPercentInput = $state("");
+  let fixedMbInput = $state("");
+
+  const DEFAULT_AUTO_PERCENT = 0.2;
+
+  let cacheMode = $derived.by(() => {
+    const s = settings;
+    if (!s) return "auto";
+    return s.realtime.cache_cap_mb === 0 ? "auto" : "fixed";
+  });
+
+  let autoComputedMb = $derived.by(() => {
+    const s = settings;
+    if (!s || totalRamMb <= 0) return 0;
+    return Math.round((totalRamMb * s.realtime.cache_auto_percent) / 100);
+  });
+
+  // Warn (don't block) when a fixed cap looks disproportionate to RAM.
+  let fixedLooksLarge = $derived.by(() => {
+    const s = settings;
+    if (!s || cacheMode !== "fixed" || totalRamMb <= 0) return false;
+    return s.realtime.cache_cap_mb > totalRamMb;
+  });
+
+  $effect(() => {
+    if (settings) {
+      autoPercentInput = String(settings.realtime.cache_auto_percent);
+      fixedMbInput = String(settings.realtime.cache_cap_mb || autoComputedMb || 8);
+    }
+  });
+
   let missingBuiltins = $derived.by(() => {
     const s = settings;
     if (!s) return [];
@@ -37,6 +70,11 @@
       daemonUp = false;
       settings = null;
       error = String(e);
+    }
+    try {
+      totalRamMb = (await api.daemonStatus()).total_ram_mb ?? 0;
+    } catch {
+      totalRamMb = 0;
     }
   }
   load();
@@ -89,6 +127,51 @@
       ...settings,
       realtime: { ...settings.realtime, auto_catchup: !settings.realtime.auto_catchup },
     });
+  }
+
+  function switchCacheMode(mode: "auto" | "fixed") {
+    if (!settings || cacheMode === mode) return;
+    if (mode === "auto") {
+      save({ ...settings, realtime: { ...settings.realtime, cache_cap_mb: 0 } });
+    } else {
+      const mb = Math.max(1, Math.round(Number(fixedMbInput) || autoComputedMb || 8));
+      save({ ...settings, realtime: { ...settings.realtime, cache_cap_mb: mb } });
+    }
+  }
+
+  function applyAutoPercent() {
+    if (!settings) return;
+    const p = Number(autoPercentInput);
+    if (!isFinite(p) || p <= 0 || p > 5) {
+      autoPercentInput = String(settings.realtime.cache_auto_percent);
+      return;
+    }
+    if (p === settings.realtime.cache_auto_percent) return;
+    save({ ...settings, realtime: { ...settings.realtime, cache_auto_percent: p } });
+  }
+
+  function applyFixedMb() {
+    if (!settings) return;
+    const mb = Math.round(Number(fixedMbInput));
+    if (!isFinite(mb) || mb < 1) {
+      fixedMbInput = String(settings.realtime.cache_cap_mb);
+      return;
+    }
+    if (mb === settings.realtime.cache_cap_mb) return;
+    save({ ...settings, realtime: { ...settings.realtime, cache_cap_mb: mb } });
+  }
+
+  function resetAutoPercent() {
+    if (!settings) return;
+    save({
+      ...settings,
+      realtime: { ...settings.realtime, cache_auto_percent: DEFAULT_AUTO_PERCENT },
+    });
+  }
+
+  function resetCacheToAuto() {
+    if (!settings) return;
+    save({ ...settings, realtime: { ...settings.realtime, cache_cap_mb: 0 } });
   }
 
   function toggleDefaultQuarantine() {
@@ -252,6 +335,88 @@
           </div>
         </div>
         {@render toggle(settings.realtime.auto_catchup, toggleAutoCatchup, "Automatic catch-up sweeps")}
+      </div>
+
+      <div class="mt-5 border-t border-edge pt-5">
+        <div class="flex items-start justify-between gap-6">
+          <div>
+            <div class="text-sm font-medium">Verdict cache</div>
+            <div class="mt-1 text-xs text-muted">
+              Remembers scan results so unchanged files are never re-scanned. Bigger cache means
+              fewer re-scans and less CPU; it fills up only as files are actually seen, never in
+              advance.
+            </div>
+          </div>
+          <div class="flex shrink-0 overflow-hidden rounded-lg border border-edge">
+            <button
+              class="px-3 py-1.5 text-xs transition-colors {cacheMode === 'auto'
+                ? 'bg-accent/15 text-accent'
+                : 'text-muted hover:bg-surface-2/60'}"
+              onclick={() => switchCacheMode("auto")}
+            >
+              Auto
+            </button>
+            <button
+              class="border-l border-edge px-3 py-1.5 text-xs transition-colors {cacheMode ===
+              'fixed'
+                ? 'bg-accent/15 text-accent'
+                : 'text-muted hover:bg-surface-2/60'}"
+              onclick={() => switchCacheMode("fixed")}
+            >
+              Fixed
+            </button>
+          </div>
+        </div>
+
+        {#if cacheMode === "auto"}
+          <div class="mt-3 flex flex-wrap items-center gap-2">
+            <input
+              class="w-20 rounded-lg border border-edge bg-bg px-3 py-2 font-mono text-xs outline-none focus:border-accent"
+              type="number"
+              min="0.05"
+              max="5"
+              step="0.05"
+              bind:value={autoPercentInput}
+              onchange={applyAutoPercent}
+              spellcheck="false"
+            />
+            <span class="text-xs text-muted">% of RAM</span>
+            {#if totalRamMb > 0}
+              <span class="text-xs text-muted">≈ {autoComputedMb} MB on this machine</span>
+            {/if}
+            <button
+              class="btn btn-ghost"
+              onclick={resetAutoPercent}
+              disabled={settings?.realtime.cache_auto_percent === DEFAULT_AUTO_PERCENT}
+            >
+              <RotateCcw size={13} /> Default (0.2%)
+            </button>
+          </div>
+        {:else}
+          <div class="mt-3 flex flex-wrap items-center gap-2">
+            <input
+              class="w-24 rounded-lg border border-edge bg-bg px-3 py-2 font-mono text-xs outline-none focus:border-accent"
+              type="number"
+              min="1"
+              bind:value={fixedMbInput}
+              onchange={applyFixedMb}
+              spellcheck="false"
+            />
+            <span class="text-xs text-muted">MB</span>
+            <button class="btn btn-ghost" onclick={resetCacheToAuto}>
+              <RotateCcw size={13} /> Use auto instead
+            </button>
+          </div>
+          {#if fixedLooksLarge}
+            <div class="mt-3 flex items-start gap-2 rounded-lg border border-warn/40 bg-warn/5 p-3 text-xs text-warn">
+              <TriangleAlert size={14} class="mt-0.5 shrink-0" />
+              <span
+                >That's more than this machine's total RAM ({totalRamMb} MB). Fine if you know
+                what you're doing, but double-check the number.</span
+              >
+            </div>
+          {/if}
+        {/if}
       </div>
     </div>
 

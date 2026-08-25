@@ -16,6 +16,11 @@ pub const BUILTIN_EXCLUSION_PATHS: [&str; 4] = ["/proc", "/sys", "/dev", "/run"]
 /// the built-in exclusions.
 pub const BUILTIN_GATE_PATHS: [&str; 2] = ["/usr", "/boot"];
 
+/// Default verdict-cache auto-allocation: this percent of total RAM.
+/// Overridable via `realtime.cache_auto_percent`; `realtime.cache_cap_mb`
+/// (0 = auto) pins a fixed size instead.
+pub const DEFAULT_CACHE_AUTO_PERCENT: f64 = 0.2;
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -34,6 +39,11 @@ pub struct RealtimeSettings {
     // Automatic catch-up sweep of a mount after visibility loss
     // (kernel queue overflow). Phase B.
     pub auto_catchup: bool,
+    // Verdict cache cap. 0 = auto (cache_auto_percent of total RAM);
+    // >0 = fixed size in MB.
+    pub cache_cap_mb: u64,
+    // Auto-allocation percentage of total RAM for the verdict cache.
+    pub cache_auto_percent: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,6 +69,8 @@ impl Default for RealtimeSettings {
             auto_quarantine: true,
             scan_on_open: true,
             auto_catchup: true,
+            cache_cap_mb: 0,
+            cache_auto_percent: DEFAULT_CACHE_AUTO_PERCENT,
         }
     }
 }
@@ -191,6 +203,8 @@ mod tests {
         assert!(s.realtime.auto_quarantine);
         assert!(s.realtime.scan_on_open);
         assert!(s.realtime.auto_catchup);
+        assert_eq!(s.realtime.cache_cap_mb, 0);
+        assert!((s.realtime.cache_auto_percent - DEFAULT_CACHE_AUTO_PERCENT).abs() < f64::EPSILON);
         assert!(s.scan.default_quarantine);
         assert_eq!(s.exclusions.paths, BUILTIN_EXCLUSION_PATHS);
         assert!(s.exclusions.extensions.is_empty());

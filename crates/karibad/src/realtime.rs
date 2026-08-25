@@ -49,7 +49,9 @@ const VERDICT_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_TIMEOUT_MS: i32 = 500;
 const ENGINE: &str = "ClamAV";
-const CACHE_CAP: usize = 100_000;
+// Cap for the small bookkeeping maps (churn state, error suppression),
+// not the verdict cache (which is size-budgeted).
+const BOUNDED_MAP_CAP: usize = 100_000;
 const WORKERS: usize = 4;
 // In-memory queue cap; beyond it paths spill to SQLite, so coverage is
 // preserved without unbounded RAM.
@@ -76,6 +78,16 @@ const CHURN_COOLDOWN: Duration = Duration::from_secs(5);
 // Cache persistence cadence and location.
 const CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 const CACHE_FILE: &str = "rtcache.json";
+// Verdict-cache sizing: the budget is a RAM ceiling (configured fixed MB,
+// or a percent of total RAM in auto mode), never pre-allocated — the cache
+// only grows as verdicts appear. Floor keeps tiny machines functional.
+const CACHE_FLOOR_BYTES: u64 = 8 * 1024 * 1024;
+// In-memory cost runs above the serialized size (hashmap overhead,
+// allocated strings); budget enforcement converts with this factor.
+const CACHE_RAM_FACTOR_NUM: u64 = 3;
+const CACHE_RAM_FACTOR_DEN: u64 = 2;
+// Used until the first save/load measures the real average entry size.
+const DEFAULT_ENTRY_BYTES: u64 = 256;
 // Catch-up sweep pacing: only feed paths while the live queue is shallow.
 const SWEEP_YIELD_AT: usize = 1_000;
 const SWEEP_FLUSH_BATCH: usize = 500;
@@ -463,14 +475,67 @@ fn cache_file_path(data_dir: &Path) -> PathBuf {
     data_dir.join(CACHE_FILE)
 }
 
-fn load_cache(data_dir: &Path) -> HashMap<CacheKey, Verdict> {
+fn fmt_bytes(bytes: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
+}
+
+/// Estimated in-memory cost of the cache at a given entry count.
+fn cache_ram_estimate(entries: usize, avg_entry_bytes: u64) -> u64 {
+    entries as u64 * avg_entry_bytes * CACHE_RAM_FACTOR_NUM / CACHE_RAM_FACTOR_DEN
+}
+
+/// Verdict-cache RAM budget from settings: fixed MB when `cache_cap_mb > 0`,
+/// otherwise `cache_auto_percent` of total RAM with an 8 MB floor. Returns
+/// the budget and a human-readable derivation for the startup log.
+fn cache_budget(settings: &kariba_core::config::Settings) -> (u64, String) {
+    let mb = settings.realtime.cache_cap_mb;
+    if mb > 0 {
+        return (
+            mb.saturating_mul(1024 * 1024),
+            format!("{} (configured)", fmt_bytes(mb.saturating_mul(1024 * 1024))),
+        );
+    }
+    let percent = settings.realtime.cache_auto_percent;
+    let ram = kariba_core::system::total_ram_bytes();
+    let raw = ram
+        .map(|r| (r as f64 * percent / 100.0) as u64)
+        .unwrap_or(0);
+    let floored = raw.max(CACHE_FLOOR_BYTES);
+    let desc = match ram {
+        Some(r) => format!(
+            "{} (auto: {percent}% of {} RAM{})",
+            fmt_bytes(floored),
+            fmt_bytes(r),
+            if raw < CACHE_FLOOR_BYTES {
+                ", 8 MB floor"
+            } else {
+                ""
+            }
+        ),
+        None => format!("{} (auto fallback, RAM unknown)", fmt_bytes(floored)),
+    };
+    (floored, desc)
+}
+
+fn load_cache(data_dir: &Path) -> (HashMap<CacheKey, Verdict>, Option<u64>) {
     let Ok(raw) = fs::read_to_string(cache_file_path(data_dir)) else {
-        return HashMap::new();
+        return (HashMap::new(), None);
     };
     let Ok(entries) = serde_json::from_str::<Vec<CacheFileEntry>>(&raw) else {
-        return HashMap::new();
+        return (HashMap::new(), None);
     };
-    entries
+    // Measured average serialized entry size; budget enforcement converts
+    // it to a RAM estimate.
+    let avg = (!entries.is_empty()).then(|| (raw.len() / entries.len()) as u64);
+    let map = entries
         .into_iter()
         .map(|e| {
             (
@@ -486,7 +551,8 @@ fn load_cache(data_dir: &Path) -> HashMap<CacheKey, Verdict> {
                 },
             )
         })
-        .collect()
+        .collect();
+    (map, avg)
 }
 
 /// Per-path churn state: when it was last queued for scanning, and
@@ -515,6 +581,13 @@ struct Shared {
     mounts: Vec<PathBuf>,
     cache: Mutex<HashMap<CacheKey, Verdict>>,
     cache_dirty: AtomicBool,
+    // Size-based cap (RAM bytes) and the measured average serialized
+    // entry size used to estimate RAM cost.
+    cache_budget: u64,
+    // Human-readable derivation, logged at startup (GUI computes its own).
+    #[allow(dead_code)]
+    cache_budget_desc: String,
+    avg_entry_bytes: AtomicU64,
     last_cache_save: Mutex<Instant>,
     churn: Mutex<HashMap<PathBuf, ChurnEntry>>,
     recent_errors: Mutex<HashMap<PathBuf, (String, Instant)>>,
@@ -553,11 +626,31 @@ impl Shared {
             .lock()
             .map(|mut db| db.insert_scan("realtime", &["<real-time protection>".into()]))
             .unwrap_or(0);
-        let cache = load_cache(&ctx.data_dir);
+        let (cache_budget, cache_budget_desc) = cache_budget(&ctx.settings);
+        let (mut cache, measured_avg) = load_cache(&ctx.data_dir);
+        let avg = measured_avg.unwrap_or(DEFAULT_ENTRY_BYTES);
         let loaded = cache.len();
-        if loaded > 0 {
-            eprintln!("karibad: real-time: loaded {loaded} cached verdict(s) from disk");
+        let file_bytes = loaded as u64 * avg;
+        // Trim a cache that outgrew its (possibly lowered) budget.
+        let mut trimmed = 0usize;
+        while cache_ram_estimate(cache.len(), avg) > cache_budget && !cache.is_empty() {
+            let excess = cache.len() / 2;
+            let victims: Vec<CacheKey> = cache.keys().take(excess).cloned().collect();
+            for key in victims {
+                cache.remove(&key);
+            }
+            trimmed += excess;
         }
+        if trimmed > 0 {
+            eprintln!(
+                "karibad: real-time: verdict cache: trimmed {trimmed} entries to fit the budget"
+            );
+        }
+        eprintln!(
+            "karibad: real-time: verdict cache: {loaded} entries (~{} on disk); budget {}",
+            fmt_bytes(file_bytes),
+            cache_budget_desc
+        );
         Self {
             exclusions,
             auto_quarantine: ctx.settings.realtime.auto_quarantine,
@@ -567,6 +660,9 @@ impl Shared {
             mounts,
             cache: Mutex::new(cache),
             cache_dirty: AtomicBool::new(false),
+            cache_budget,
+            cache_budget_desc,
+            avg_entry_bytes: AtomicU64::new(avg),
             last_cache_save: Mutex::new(Instant::now()),
             churn: Mutex::new(HashMap::new()),
             recent_errors: Mutex::new(HashMap::new()),
@@ -640,12 +736,13 @@ impl Shared {
     }
 
     fn cache_put(&self, key: CacheKey, verdict: Verdict) {
+        let avg = self.avg_entry_bytes.load(Ordering::Relaxed);
         let mut cache = self.cache.lock().unwrap();
-        if cache.len() >= CACHE_CAP {
-            // Evict an arbitrary half, never the whole cache: a full clear
-            // causes system-wide re-check waves (seen live: waybar scripts
-            // re-scanned after read-check verdicts crossed the cap).
-            let excess = cache.len() - CACHE_CAP / 2;
+        // Size-based eviction: estimated RAM cost over budget -> evict an
+        // arbitrary half, never the whole cache (a full clear causes
+        // system-wide re-check waves).
+        if cache_ram_estimate(cache.len() + 1, avg) > self.cache_budget && !cache.is_empty() {
+            let excess = cache.len() / 2;
             let victims: Vec<CacheKey> = cache.keys().take(excess).cloned().collect();
             for key in victims {
                 cache.remove(&key);
@@ -678,9 +775,15 @@ impl Shared {
                 },
             })
             .collect();
+        let entry_count = entries.len();
         let Ok(raw) = serde_json::to_string(&entries) else {
             return;
         };
+        // Refresh the measured average serialized entry size; budget
+        // enforcement uses it to estimate RAM cost.
+        if let Some(avg) = raw.len().checked_div(entry_count) {
+            self.avg_entry_bytes.store(avg as u64, Ordering::Relaxed);
+        }
         let path = cache_file_path(&self.data_dir);
         let tmp = path.with_extension("json.tmp");
         if fs::write(&tmp, raw).is_ok() {
@@ -694,7 +797,7 @@ impl Shared {
     /// (latest-wins). Returns true when the path should be enqueued now.
     fn churn_try_queue(&self, path: &Path) -> bool {
         let mut churn = self.churn.lock().unwrap();
-        if churn.len() > CACHE_CAP {
+        if churn.len() > BOUNDED_MAP_CAP {
             churn.clear();
         }
         let now = Instant::now();
@@ -904,7 +1007,7 @@ impl Shared {
         {
             return;
         }
-        if recent.len() > CACHE_CAP {
+        if recent.len() > BOUNDED_MAP_CAP {
             recent.clear();
         }
         recent.insert(path.to_path_buf(), (message.to_string(), now));
@@ -1636,6 +1739,36 @@ fn intake_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_fixed_mode_uses_exact_mb() {
+        let mut settings = kariba_core::config::Settings::default();
+        settings.realtime.cache_cap_mb = 64;
+        let (bytes, desc) = cache_budget(&settings);
+        assert_eq!(bytes, 64 * 1024 * 1024);
+        assert!(desc.contains("configured"));
+    }
+
+    #[test]
+    fn budget_auto_mode_is_percent_of_ram_with_floor() {
+        let settings = kariba_core::config::Settings::default();
+        let (bytes, desc) = cache_budget(&settings);
+        assert!(bytes >= CACHE_FLOOR_BYTES);
+        assert!(desc.contains("auto"));
+        // Whatever this machine has, 0.2% of it (or the floor) is far
+        // below the RAM itself.
+        if let Some(ram) = kariba_core::system::total_ram_bytes() {
+            assert!(bytes <= ram / 2);
+        }
+    }
+
+    #[test]
+    fn ram_estimate_scales_with_entries_and_avg() {
+        assert_eq!(cache_ram_estimate(0, 256), 0);
+        assert_eq!(cache_ram_estimate(1000, 256), 1000 * 256 * 3 / 2);
+        assert!(cache_ram_estimate(2000, 256) > cache_ram_estimate(1000, 256));
+        assert!(cache_ram_estimate(1000, 512) > cache_ram_estimate(1000, 256));
+    }
 
     #[test]
     fn classification_lanes() {

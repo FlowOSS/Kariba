@@ -31,6 +31,7 @@ export interface StatusResult {
   protection_enabled: boolean;
   realtime_active: boolean;
   realtime_detail: string;
+  total_ram_mb: number;
 }
 
 export interface RealtimeDetection {
@@ -45,6 +46,8 @@ export interface RealtimeSettings {
   auto_quarantine: boolean;
   scan_on_open: boolean;
   auto_catchup: boolean;
+  cache_cap_mb: number;
+  cache_auto_percent: number;
 }
 
 export interface ScanSettings {

@@ -399,19 +399,36 @@ fn apply_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), kari
             .filter(|s| !s.is_empty())
             .collect()
     }
+    fn parse_u64(value: &str) -> Result<u64, kariba_ipc::RpcError> {
+        value.parse().map_err(|_| {
+            kariba_ipc::RpcError::new(-32602, format!("expected a whole number, got: {value}"))
+        })
+    }
+    fn parse_f64(value: &str) -> Result<f64, kariba_ipc::RpcError> {
+        value.parse().map_err(|_| {
+            kariba_ipc::RpcError::new(-32602, format!("expected a number, got: {value}"))
+        })
+    }
     match key {
         "realtime.enabled" => settings.realtime.enabled = parse_bool(value)?,
         "realtime.auto_quarantine" => settings.realtime.auto_quarantine = parse_bool(value)?,
+        "realtime.scan_on_open" => settings.realtime.scan_on_open = parse_bool(value)?,
+        "realtime.auto_catchup" => settings.realtime.auto_catchup = parse_bool(value)?,
+        "realtime.cache_cap_mb" => settings.realtime.cache_cap_mb = parse_u64(value)?,
+        "realtime.cache_auto_percent" => settings.realtime.cache_auto_percent = parse_f64(value)?,
         "scan.default_quarantine" => settings.scan.default_quarantine = parse_bool(value)?,
         "exclusions.paths" => settings.exclusions.paths = parse_list(value),
         "exclusions.extensions" => settings.exclusions.extensions = parse_list(value),
+        "exclusions.gate_paths" => settings.exclusions.gate_paths = parse_list(value),
         other => {
             return Err(kariba_ipc::RpcError::new(
                 -32602,
                 format!(
                     "unknown key: {other}. Valid keys: realtime.enabled, \
-                     realtime.auto_quarantine, scan.default_quarantine, \
-                     exclusions.paths, exclusions.extensions"
+                     realtime.auto_quarantine, realtime.scan_on_open, \
+                     realtime.auto_catchup, realtime.cache_cap_mb, \
+                     realtime.cache_auto_percent, scan.default_quarantine, \
+                     exclusions.paths, exclusions.extensions, exclusions.gate_paths"
                 ),
             ));
         }

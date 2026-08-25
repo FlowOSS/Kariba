@@ -129,6 +129,10 @@ fn main() {
         }
     );
     println!("  data dir: {}", paths::data_dir().display());
+    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+        println!("  fd limit: {}", lim.rlim_cur);
+    }
     let (realtime_active, realtime_detail) = daemon.realtime_status();
     println!(
         "  real-time: {} ({realtime_detail})",
