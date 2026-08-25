@@ -9,8 +9,12 @@ repository.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["image-png"] }
 kariba-core.workspace = true
 kariba-ipc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["tokio", "blocking"] }

@@ -6,8 +6,13 @@
   import Quarantine from "./components/Quarantine.svelte";
   import Survey from "./components/Survey.svelte";
   import SettingsView from "./components/Settings.svelte";
+  import Mini from "./components/Mini.svelte";
   import type { View } from "./lib/types";
   import { startRealtimeEvents, onRealtimeDetection } from "./lib/api";
+
+  // The tray popup window loads this app with ?mode=popup and gets the
+  // compact Mini UI instead of the full shell.
+  const isPopup = new URLSearchParams(window.location.search).get("mode") === "popup";
 
   let view = $state<View>("dashboard");
   let scanPreset = $state<string[]>([]);
@@ -38,22 +43,26 @@
   }
 </script>
 
-<div class="flex h-full flex-col">
-  <Titlebar />
-  <div class="flex min-h-0 flex-1">
-    <Sidebar {view} onnavigate={navigate} unseen={unseenCatches} />
-    <main class="flex-1 overflow-y-auto">
-      {#if view === "dashboard"}
-        <Dashboard onquickscan={quickScan} onnavigate={navigate} />
-      {:else if view === "scan"}
-        <ScanView preset={scanPreset} onnavigate={navigate} />
-      {:else if view === "quarantine"}
-        <Quarantine />
-      {:else if view === "survey"}
-        <Survey />
-      {:else}
-        <SettingsView />
-      {/if}
-    </main>
+{#if isPopup}
+  <Mini />
+{:else}
+  <div class="flex h-full flex-col">
+    <Titlebar />
+    <div class="flex min-h-0 flex-1">
+      <Sidebar {view} onnavigate={navigate} unseen={unseenCatches} />
+      <main class="flex-1 overflow-y-auto">
+        {#if view === "dashboard"}
+          <Dashboard onquickscan={quickScan} onnavigate={navigate} />
+        {:else if view === "scan"}
+          <ScanView preset={scanPreset} onnavigate={navigate} />
+        {:else if view === "quarantine"}
+          <Quarantine />
+        {:else if view === "survey"}
+          <Survey />
+        {:else}
+          <SettingsView />
+        {/if}
+      </main>
+    </div>
   </div>
-</div>
+{/if}

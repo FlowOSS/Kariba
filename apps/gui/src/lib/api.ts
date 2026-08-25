@@ -53,6 +53,10 @@ export function threatsHistory(status?: string): Promise<ThreatHistoryItem[]> {
   return invoke<ThreatHistoryItem[]>("threats_history", { status: status ?? null });
 }
 
+export function showMainWindow(): Promise<void> {
+  return invoke<void>("show_main_window");
+}
+
 export function settingsGet(): Promise<Settings> {
   return invoke<Settings>("settings_get");
 }

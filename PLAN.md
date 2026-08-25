@@ -1169,10 +1169,10 @@ public artifact is `0.1.0-alpha.1`; plain `0.1.0` when this list is done.
 
 **Feature gaps (Phase 1 items still open)**
 
-- [ ] System tray: StatusNotifierItem icon with protection state
-      (green/yellow/red), quick actions (quick scan, toggle protection),
-      minimal idle footprint. Phase 1 item 5; the GUI otherwise has no
-      always-on presence.
+- [x] System tray: StatusNotifierItem icon with protection state
+      (green/yellow/red/gray), menu (Open · Quick Scan · Full Scan ·
+      Real-time toggle · Quit), left-click mini popup with status,
+      recent catches and quick actions; main window close hides to tray.
 - [ ] Desktop notifications on real-time detections (Known Issue #2):
       detection while the GUI is closed/unfocused is currently silent.
 - [ ] Catch-up sweep visibility (Known Issue #4): a running sweep is only
