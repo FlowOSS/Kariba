@@ -405,6 +405,24 @@ fn normalize_settings(settings: &mut Settings) -> Result<(), RpcError> {
     }
     settings.exclusions.extensions = extensions;
 
+    let mut seen_gate = HashSet::new();
+    let mut gate_paths = Vec::new();
+    for raw in settings.exclusions.gate_paths.drain(..) {
+        let path = raw.trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        if !(path.starts_with('/') || path.starts_with("~/")) {
+            return Err(invalid_params(format!(
+                "gate path must be absolute or start with ~/: {path}"
+            )));
+        }
+        if seen_gate.insert(path.clone()) {
+            gate_paths.push(path);
+        }
+    }
+    settings.exclusions.gate_paths = gate_paths;
+
     Ok(())
 }
 

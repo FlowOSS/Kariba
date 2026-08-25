@@ -421,6 +421,26 @@ follow:
   an unscanned file scans it), service supervision with restart-on-crash
   in the packaging phase, and scheduled sweeps.
 
+**Catch-up sweeps.** Recovery for lost visibility, gated by
+`realtime.auto_catchup` (default on). Trigger: `FAN_Q_OVERFLOW` — the
+kernel dropped events and reports it, so the affected mount is marked
+degraded and scheduled for a sweep. (Load-shed MEDIA needs no sweep: those
+paths spill to `pending_scans`, nothing lost.) A sweep is the existing
+on-demand scanner pointed at the whole affected mount, recorded in history
+as its own scan kind (`catchup`). Performance rules, because a full-mount
+scan is the most expensive thing real-time can schedule:
+
+- Yields to live traffic: it only advances while the live queue is
+  essentially empty; any burst of new events preempts it.
+- Runs low priority and cancellable like any scan.
+- Exclusions apply; the triage classification still orders what it scans.
+- Visible in scan history with progress; never a silent disk-eater.
+- Optional scans-per-second cap is a future knob if yield-pacing ever
+  proves insufficient.
+
+GUI/TUI representation of a running sweep (progress surface, "sweep in
+progress" state) is deliberately deferred — see Known Issues.
+
 **Privilege & degradation.** `FAN_CLASS_CONTENT` requires CAP_SYS_ADMIN: a
 non-root dev daemon reports `realtime_active = false` with the reason and
 never crashes. Root-mode testing uses `sudo ./target/debug/karibad` + CLI.
@@ -804,6 +824,8 @@ defaults, so hand-edited partial files work.
 [realtime]
 enabled = true            # master switch; fanotify slice reads this
 auto_quarantine = true
+scan_on_open = true       # cache-first FAN_OPEN read checks (Phase B)
+auto_catchup = true       # auto catch-up sweep on visibility loss (Phase B)
 
 [scan]
 default_quarantine = true # applies when a client sends no explicit choice
@@ -884,7 +906,8 @@ Assumptions to Verify.
     surfaced in the activity feed (the differentiator).
 13. **UI/UX polish** — animations, keyboard shortcuts, a11y audit, themes.
 14. **Performance** — parallel scanning, backpressure-aware IPC progress,
-    lazy UI loading.
+    lazy UI loading. Must land alongside the performance-evaluation harness
+    below so every optimization is measured, not assumed.
 15. **Packaging & docs** — .deb/.rpm/AppImage, init scripts (systemd
     `[ASSUMPTION]`, OpenRC), polkit configs, user guide, contribution guide.
 16. **Launch** — GitHub release, r/linux, Hacker News, distro subreddits.
@@ -945,6 +968,11 @@ Exposed during GUI testing (2026-08-23) — fix before alpha:
    - Above a sane cap: don't copy and don't pretend clean — record an
      explicit "skipped (too large)" verdict in history so coverage gaps
      are visible, never silent.
+4. **Catch-up sweeps have no GUI/TUI representation yet** — a running
+   sweep is only visible as a `catchup` row in scan history. Needs a
+   progress surface and a visible "sweep in progress" state (Dashboard
+   and/or tray) so the user knows why disks are busy after an overflow.
+   Deferred by design until the sweep mechanics themselves land.
 
 Resolved (2026-08-23): DB lock held for whole scan (scanner now takes
 short-lived locks per DB operation; GUI commands are async, so status /
@@ -961,6 +989,56 @@ clients no longer leave scans running).
   restore round-trips byte-identical)
 - CI: GitHub Actions — build, `clippy`, `cargo test`, package smoke tests in
   Ubuntu + Fedora containers
+
+### Performance Evaluation Harness (CI/CD stage)
+
+When build + CI/CD pipelines are set up, add a dedicated, repeatable
+performance-evaluation stage. Ambition: Kariba must stay usable on the
+lowest viable hardware (think old Chromebooks / low-end laptops) **without
+compromising any security measure** — the queue, the exec gate, catch-up
+sweeps, and fail-open behavior all stay on during these measurements; we
+measure their cost, we don't disable them to hit a number.
+
+- **Workload mix**: create/read/write/execute a large, varied file set —
+  many small files (config/text), medium binaries, a few large files
+  (hundreds of MB), plus realistic bursts (thousands of files at once) and
+  sustained churn (a file rewritten repeatedly, like a live DB).
+- **A/B runs**: each workload runs twice — with real-time protection off
+  (baseline) and on (scanning). The delta is the reported overhead.
+- **Metrics to capture**: scan throughput (files/s, MB/s), exec-gate
+  latency percentiles (p50/p95/p99 — the user-visible "my app froze to be
+  checked" number), end-to-end burst drain time, memory + CPU of `karibad`
+  and `clamd`, queue/backlog depth over time, cache hit rate.
+- **Reports**: emit machine-readable results (e.g. JSON/CSV) plus a
+  rendered summary per run, stored as CI artifacts, so regressions are
+  diffable run-over-run and we can set alerts on thresholds (e.g. p99 exec
+  latency or scan-throughput regressions).
+- **Low-end target**: run the harness on (or emulate) a constrained box
+  (limited CPU cores, capped RAM, slow disk) so "works on a Chromebook" is
+  measured, not hoped for.
+- **Guardrail**: a performance regression must never be "fixed" by silently
+  weakening protection; if a threshold and a security measure conflict,
+  that's a design decision to surface, not a knob to flip.
+
+### Test Layout (refactor)
+
+Unit tests currently live in `#[cfg(test)] mod tests` at the bottom of each
+source file. As files grow (realtime.rs is already large), split tests out
+to keep production code readable:
+
+- **Colocated test modules/files**: put tests next to the code they cover —
+  e.g. a `realtime` module with a sibling `realtime_tests.rs` (or a
+  `tests/` submodule) rather than an inline tail. Keeps `realtime.rs`
+  focused on logic.
+- **Extract testable units**: pure helpers (triage `classify`, the churn
+  gate, the verdict cache, ETA formatting) are the easiest to move and the
+  most worth isolating; consider giving them their own small modules.
+- **Integration tests**: keep cross-cutting scenarios (EICAR pipeline,
+  quarantine round-trips, burst + spill + resume) in the crate's
+  `tests/` dir as integration tests, not buried in a unit block.
+- Constraint: anything needing root/fanotify stays out of `cargo test`'s
+  default fast path (gated/ignored), so the suite stays quick and
+  CI-friendly.
 
 ## Monetization (Optional)
 

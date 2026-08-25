@@ -27,6 +27,7 @@ const FAN_MARK_MOUNT: libc::c_uint = 0x0000_0010;
 
 // Event mask bits
 pub const FAN_CLOSE_WRITE: u64 = 0x0000_0008;
+pub const FAN_OPEN: u64 = 0x0000_0020;
 pub const FAN_OPEN_EXEC_PERM: u64 = 0x0004_0000;
 pub const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
 

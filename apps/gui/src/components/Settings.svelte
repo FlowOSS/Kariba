@@ -75,6 +75,22 @@
     });
   }
 
+  function toggleScanOnOpen() {
+    if (!settings) return;
+    save({
+      ...settings,
+      realtime: { ...settings.realtime, scan_on_open: !settings.realtime.scan_on_open },
+    });
+  }
+
+  function toggleAutoCatchup() {
+    if (!settings) return;
+    save({
+      ...settings,
+      realtime: { ...settings.realtime, auto_catchup: !settings.realtime.auto_catchup },
+    });
+  }
+
   function toggleDefaultQuarantine() {
     if (!settings) return;
     save({
@@ -214,6 +230,28 @@
           </div>
         </div>
         {@render toggle(settings.realtime.auto_quarantine, toggleAutoQuarantine, "Auto-quarantine detections")}
+      </div>
+
+      <div class="mt-5 flex items-start justify-between gap-6 border-t border-edge pt-5">
+        <div>
+          <div class="text-sm font-medium">Scan files when opened</div>
+          <div class="mt-1 text-xs text-muted">
+            Check files on read, using cached verdicts when unchanged. Catches files that landed
+            while Kariba was off.
+          </div>
+        </div>
+        {@render toggle(settings.realtime.scan_on_open, toggleScanOnOpen, "Scan files when opened")}
+      </div>
+
+      <div class="mt-5 flex items-start justify-between gap-6 border-t border-edge pt-5">
+        <div>
+          <div class="text-sm font-medium">Automatic catch-up sweeps</div>
+          <div class="mt-1 text-xs text-muted">
+            Re-scan a mount in the background if events were ever lost under extreme load. Runs
+            behind live protection and can be cancelled.
+          </div>
+        </div>
+        {@render toggle(settings.realtime.auto_catchup, toggleAutoCatchup, "Automatic catch-up sweeps")}
       </div>
     </div>
 

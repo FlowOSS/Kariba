@@ -5,19 +5,27 @@
 //!
 //! - `FAN_OPEN_EXEC_PERM` — the exec gate, the sole synchronous path.
 //!   Verdicts are bounded (L1), batch-budgeted (L2), and the response is
-//!   written before any bookkeeping (L3).
-//! - `FAN_CLOSE_WRITE` — detect-at-landing, queued for the worker pool.
+//!   written before any bookkeeping (L3). Gate exclusions (default
+//!   `/usr`, `/boot`) skip verdicts entirely for system paths.
+//! - `FAN_CLOSE_WRITE` — detect-at-landing, queued into triage lanes.
+//! - `FAN_OPEN` — cache-first read checks (toggle `scan_on_open`): clean
+//!   unchanged files cost a hashmap lookup; misses queue an async scan.
+//!
+//! Triage lanes drain in priority order EXEC → DATA → MEDIA; churn files
+//! (live databases, logs) get a per-path cooldown; backlog and catch-up
+//! sweep paths sit behind all live traffic.
 //!
 //! Safety layers against lockups: intake never does slow work; a watchdog
 //! closes the fanotify fd if intake stalls (kernel auto-allows all pending
 //! permission events) and restarts the watcher; shutdown closes the fd
 //! FIRST, then persists the queue, then interrupts workers. The kernel
-//! queue is bounded — overflow arrives as `FAN_Q_OVERFLOW` and degrades
-//! visibility loudly instead of pinning unbounded kernel resources.
+//! queue is bounded — overflow arrives as `FAN_Q_OVERFLOW`, is logged, and
+//! triggers a low-priority catch-up sweep of the watched mounts.
 
 use kariba_engine_clamav::{ClamdClient, ScanOutcome};
 use kariba_ipc::Notification;
 use kariba_ipc::protocol::{RealtimeDetection, method};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::Shutdown;
@@ -62,6 +70,15 @@ const BACKLOG_HIGH: u64 = 1_000;
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const WATCHDOG_STALL: Duration = Duration::from_secs(3);
 const MAX_WATCHER_RESTARTS: u32 = 3;
+// Churn cooldown: live databases rewrite constantly; re-scan them at most
+// this often, latest-wins.
+const CHURN_COOLDOWN: Duration = Duration::from_secs(5);
+// Cache persistence cadence and location.
+const CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(30);
+const CACHE_FILE: &str = "rtcache.json";
+// Catch-up sweep pacing: only feed paths while the live queue is shallow.
+const SWEEP_YIELD_AT: usize = 1_000;
+const SWEEP_FLUSH_BATCH: usize = 500;
 
 #[derive(Clone)]
 pub struct WatcherCtx {
@@ -98,6 +115,111 @@ impl FanFd {
     }
 }
 
+/// File metadata from fstat (event fd) or stat (path). dev+ino identify
+/// the file object across renames; mtime+size detect content changes.
+#[derive(Debug, Clone, Copy)]
+struct FileMeta {
+    dev: u64,
+    ino: u64,
+    mtime_secs: u64,
+    size: u64,
+    mode: u32,
+    is_dir: bool,
+}
+
+fn fstat_meta(fd: RawFd) -> Option<FileMeta> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    Some(FileMeta {
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+        mtime_secs: stat.st_mtime as u64,
+        size: stat.st_size as u64,
+        mode: stat.st_mode as u32,
+        is_dir: stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+    })
+}
+
+fn stat_meta(path: &Path) -> Option<FileMeta> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).ok()?;
+    let mtime_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(FileMeta {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mtime_secs,
+        size: metadata.len(),
+        mode: metadata.mode(),
+        is_dir: metadata.is_dir(),
+    })
+}
+
+/// Triage lanes: a scheduling decision, not a security one. Every lane is
+/// still scanned; lanes only decide the order (and what yields first when
+/// the queue overflows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Exec,
+    Data,
+    Media,
+    Churn,
+}
+
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "avif", "ttf", "otf", "woff",
+    "woff2", "mp3", "mp4", "wav", "flac", "ogg", "oga", "opus", "mkv", "avi", "webm", "mov", "m4a",
+    "aac",
+];
+
+/// Zero-I/O classification (path + mode come from the event's fstat).
+fn classify(path: &Path, mode: u32) -> Lane {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // Churn first: live databases and logs, even in odd locations.
+    if name.ends_with("-wal")
+        || name.ends_with("-journal")
+        || name.ends_with(".sqlite")
+        || name.ends_with(".sqlite3")
+        || name.ends_with(".bdb")
+        || name.ends_with(".db")
+        || name.ends_with(".log")
+    {
+        return Lane::Churn;
+    }
+    // Executables: any exec bit, shared libraries, AppImages, bin dirs.
+    if mode & 0o111 != 0 {
+        return Lane::Exec;
+    }
+    if name.ends_with(".so") || name.contains(".so.") || name.ends_with(".appimage") {
+        return Lane::Exec;
+    }
+    if let Some(parent) = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        && matches!(parent, "bin" | "sbin" | "libexec")
+    {
+        return Lane::Exec;
+    }
+    // Media: inert content formats.
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && MEDIA_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    {
+        return Lane::Media;
+    }
+    Lane::Data
+}
+
 enum Task {
     Scan(PathBuf),
     // Exec gate already answered DENY; quarantine/broadcast bookkeeping
@@ -105,10 +227,10 @@ enum Task {
     GateDetection { path: PathBuf, signature: String },
 }
 
-/// Dedup'd scan queue: memory first, async SQLite spill beyond the cap.
-/// Overflow paths land in an in-memory spill buffer and a dedicated thread
-/// batches them to SQLite — intake never does disk I/O, so it cannot stall
-/// (a synchronous per-event spill once stalled it and tripped the watchdog).
+/// Dedup'd priority scan queue: EXEC → DATA → MEDIA for live traffic,
+/// backlog (spilled + catch-up paths) behind all of it, gate bookkeeping
+/// ahead of everything. Overflow spills to SQLite via an async buffer —
+/// intake never does disk I/O, so it cannot stall.
 struct ScanQueue {
     inner: Mutex<QueueInner>,
     condvar: Condvar,
@@ -117,7 +239,11 @@ struct ScanQueue {
 }
 
 struct QueueInner {
-    deque: VecDeque<Task>,
+    gate: VecDeque<Task>,
+    exec: VecDeque<PathBuf>,
+    data: VecDeque<PathBuf>,
+    media: VecDeque<PathBuf>,
+    backlog: VecDeque<PathBuf>,
     queued: HashSet<PathBuf>,
 }
 
@@ -125,7 +251,11 @@ impl ScanQueue {
     fn new(db: Arc<Mutex<Db>>) -> Self {
         Self {
             inner: Mutex::new(QueueInner {
-                deque: VecDeque::new(),
+                gate: VecDeque::new(),
+                exec: VecDeque::new(),
+                data: VecDeque::new(),
+                media: VecDeque::new(),
+                backlog: VecDeque::new(),
                 queued: HashSet::new(),
             }),
             condvar: Condvar::new(),
@@ -135,8 +265,8 @@ impl ScanQueue {
     }
 
     /// Report paths spilled during a previous lifetime. They stay in the
-    /// DB and are drained in batches only when the live queue is empty, so
-    /// fresh events always jump ahead of stale backlog.
+    /// DB and are drained only when every live lane is empty, so fresh
+    /// events always jump ahead of stale backlog.
     fn report_pending(&self) {
         let count = self.db.lock().map(|db| db.pending_count()).unwrap_or(0);
         if count > 0 {
@@ -144,21 +274,47 @@ impl ScanQueue {
         }
     }
 
-    /// Dedup'd push: a path already queued is skipped, and a burst beyond
-    /// the memory cap overflows into the spill buffer (O(1), no I/O) for
-    /// the spill thread to batch to SQLite.
-    fn push_scan(&self, path: PathBuf) {
+    /// Live-queue depth across all lanes (not backlog, not DB).
+    fn depth(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.exec.len() + inner.data.len() + inner.media.len()
+    }
+
+    /// Dedup'd push into a triage lane. Beyond the memory cap, the
+    /// lowest-priority entry spills to the SQLite buffer (O(1), no I/O) so
+    /// the new path can be queued — media yields first, then data, then
+    /// exec; nothing is ever dropped.
+    fn push_scan(&self, path: PathBuf, lane: Lane) {
         let mut inner = self.inner.lock().unwrap();
         if !inner.queued.insert(path.clone()) {
             return;
         }
-        if inner.deque.len() >= MEM_QUEUE_CAP {
+        let total = inner.exec.len() + inner.data.len() + inner.media.len();
+        if total >= MEM_QUEUE_CAP {
+            let victim = inner
+                .media
+                .pop_back()
+                .or_else(|| inner.data.pop_back())
+                .or_else(|| inner.exec.pop_back());
+            if let Some(victim) = victim {
+                inner.queued.remove(&victim);
+                drop(inner);
+                self.spill_buf.lock().unwrap().push(victim);
+                self.push_scan(path, lane);
+                return;
+            }
+            // All lanes empty yet over cap cannot happen; spill the new
+            // path to stay safe.
             inner.queued.remove(&path);
             drop(inner);
             self.spill_buf.lock().unwrap().push(path);
             return;
         }
-        inner.deque.push_back(Task::Scan(path));
+        match lane {
+            Lane::Exec => inner.exec.push_back(path),
+            Lane::Data | Lane::Churn => inner.data.push_back(path),
+            Lane::Media => inner.media.push_back(path),
+        }
         self.condvar.notify_one();
     }
 
@@ -171,8 +327,8 @@ impl ScanQueue {
     fn push_gate_detection(&self, path: PathBuf, signature: String) {
         let mut inner = self.inner.lock().unwrap();
         inner
-            .deque
-            .push_front(Task::GateDetection { path, signature });
+            .gate
+            .push_back(Task::GateDetection { path, signature });
         self.condvar.notify_one();
     }
 
@@ -187,21 +343,28 @@ impl ScanQueue {
         }
     }
 
-    /// Next task: memory queue first, then spilled DB rows. Returns None
-    /// once the exit flag is set (after finishing at most the scan in
-    /// flight) — whatever remains is persisted by the shutdown path, not
-    /// scanned, so a SIGTERM never drains a 50k backlog before exiting.
+    /// Next task: gate → exec → data → media → backlog → spilled DB rows.
+    /// Returns None once the exit flag is set (after finishing at most the
+    /// scan in flight) — whatever remains is persisted by the shutdown
+    /// path, never scanned, so a SIGTERM never drains a backlog first.
     fn pop(&self, exit: &AtomicBool, timeout: Duration) -> Option<Task> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if exit.load(Ordering::Relaxed) {
                 return None;
             }
-            if let Some(task) = inner.deque.pop_front() {
-                if let Task::Scan(path) = &task {
-                    inner.queued.remove(path);
-                }
+            if let Some(task) = inner.gate.pop_front() {
                 return Some(task);
+            }
+            let scan = inner
+                .exec
+                .pop_front()
+                .or_else(|| inner.data.pop_front())
+                .or_else(|| inner.media.pop_front())
+                .or_else(|| inner.backlog.pop_front());
+            if let Some(path) = scan {
+                inner.queued.remove(&path);
+                return Some(Task::Scan(path));
             }
             drop(inner);
             let batch = {
@@ -214,7 +377,7 @@ impl ScanQueue {
             if !batch.is_empty() {
                 for path in batch.into_iter().rev() {
                     if inner.queued.insert(path.clone()) {
-                        inner.deque.push_front(Task::Scan(path));
+                        inner.backlog.push_front(path);
                     }
                 }
                 continue;
@@ -227,13 +390,17 @@ impl ScanQueue {
     /// Drain everything still queued, returning paths to persist.
     fn drain_paths(&self) -> Vec<PathBuf> {
         let mut inner = self.inner.lock().unwrap();
-        let paths = inner
-            .deque
+        let mut paths: Vec<PathBuf> = inner
+            .gate
             .drain(..)
             .map(|task| match task {
                 Task::Scan(path) | Task::GateDetection { path, .. } => path,
             })
             .collect();
+        paths.extend(inner.exec.drain(..));
+        paths.extend(inner.data.drain(..));
+        paths.extend(inner.media.drain(..));
+        paths.extend(inner.backlog.drain(..));
         inner.queued.clear();
         paths
     }
@@ -242,12 +409,13 @@ impl ScanQueue {
         self.condvar.notify_all();
     }
 
-    /// Everything not yet scanned: memory queue + spill buffer + spilled
+    /// Everything not yet scanned: lanes + backlog + spill buffer + spilled
     /// DB rows. Used for progress/ETA logging.
     fn backlog_len(&self, db: &Mutex<Db>) -> u64 {
         let mem = {
             let inner = self.inner.lock().unwrap();
-            inner.deque.len() as u64 + self.spill_buf.lock().unwrap().len() as u64
+            (inner.exec.len() + inner.data.len() + inner.media.len() + inner.backlog.len()) as u64
+                + self.spill_buf.lock().unwrap().len() as u64
         };
         let pending = db.lock().map(|d| d.pending_count()).unwrap_or(0);
         mem + pending
@@ -260,41 +428,95 @@ enum Verdict {
     Infected(String),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// Inode-keyed verdict cache entry: rename-proof, and "unchanged" is
+/// answered without hashing.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct CacheKey {
-    path: PathBuf,
+    dev: u64,
+    ino: u64,
     mtime_secs: u64,
     size: u64,
 }
 
 impl CacheKey {
-    fn from_path(path: &Path) -> Option<Self> {
-        let metadata = fs::metadata(path).ok()?;
-        let mtime_secs = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        Some(Self {
-            path: path.to_path_buf(),
-            mtime_secs,
-            size: metadata.len(),
-        })
+    fn from_meta(meta: &FileMeta) -> Self {
+        Self {
+            dev: meta.dev,
+            ino: meta.ino,
+            mtime_secs: meta.mtime_secs,
+            size: meta.size,
+        }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CacheFileEntry {
+    dev: u64,
+    ino: u64,
+    mtime_secs: u64,
+    size: u64,
+    // None = clean; Some(signature) = infected.
+    infected: Option<String>,
+}
+
+fn cache_file_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(CACHE_FILE)
+}
+
+fn load_cache(data_dir: &Path) -> HashMap<CacheKey, Verdict> {
+    let Ok(raw) = fs::read_to_string(cache_file_path(data_dir)) else {
+        return HashMap::new();
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<CacheFileEntry>>(&raw) else {
+        return HashMap::new();
+    };
+    entries
+        .into_iter()
+        .map(|e| {
+            (
+                CacheKey {
+                    dev: e.dev,
+                    ino: e.ino,
+                    mtime_secs: e.mtime_secs,
+                    size: e.size,
+                },
+                match e.infected {
+                    Some(signature) => Verdict::Infected(signature),
+                    None => Verdict::Clean,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Per-path churn state: when it was last queued for scanning, and
+/// whether it changed again during cooldown (needs one more scan once the
+/// cooldown elapses).
+struct ChurnEntry {
+    last_queued: Instant,
+    dirty: bool,
 }
 
 /// State shared between the intake thread and the scan workers.
 struct Shared {
     exclusions: Exclusions,
     auto_quarantine: bool,
+    scan_on_open: bool,
+    auto_catchup: bool,
+    data_dir: PathBuf,
+    mounts: Vec<PathBuf>,
     cache: Mutex<HashMap<CacheKey, Verdict>>,
+    cache_dirty: AtomicBool,
+    last_cache_save: Mutex<Instant>,
+    churn: Mutex<HashMap<PathBuf, ChurnEntry>>,
     recent_errors: Mutex<HashMap<PathBuf, (String, Instant)>>,
     // Clones of worker clamd sockets so shutdown can interrupt blocked
     // scans immediately.
     worker_streams: Mutex<Vec<std::os::unix::net::UnixStream>>,
     // Watcher-level note surfaced in `status` (overflow, failed-open…).
     status_note: Arc<Mutex<Option<String>>>,
+    // Set on kernel queue overflow; the catch-up thread consumes it.
+    catchup_requested: AtomicBool,
     overflows: AtomicU64,
     db: Arc<Mutex<Db>>,
     quarantine: Arc<Quarantine>,
@@ -307,7 +529,11 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(ctx: &WatcherCtx, status_note: Arc<Mutex<Option<String>>>) -> Self {
+    fn new(
+        ctx: &WatcherCtx,
+        status_note: Arc<Mutex<Option<String>>>,
+        mounts: Vec<PathBuf>,
+    ) -> Self {
         let mut exclusions = Exclusions::from_settings(&ctx.settings);
         exclusions.add_prefix(ctx.data_dir.clone());
         exclusions.add_prefix(ctx.quarantine.dir().to_path_buf());
@@ -318,13 +544,26 @@ impl Shared {
             .lock()
             .map(|mut db| db.insert_scan("realtime", &["<real-time protection>".into()]))
             .unwrap_or(0);
+        let cache = load_cache(&ctx.data_dir);
+        let loaded = cache.len();
+        if loaded > 0 {
+            eprintln!("karibad: real-time: loaded {loaded} cached verdict(s) from disk");
+        }
         Self {
             exclusions,
             auto_quarantine: ctx.settings.realtime.auto_quarantine,
-            cache: Mutex::new(HashMap::new()),
+            scan_on_open: ctx.settings.realtime.scan_on_open,
+            auto_catchup: ctx.settings.realtime.auto_catchup,
+            data_dir: ctx.data_dir.clone(),
+            mounts,
+            cache: Mutex::new(cache),
+            cache_dirty: AtomicBool::new(false),
+            last_cache_save: Mutex::new(Instant::now()),
+            churn: Mutex::new(HashMap::new()),
             recent_errors: Mutex::new(HashMap::new()),
             worker_streams: Mutex::new(Vec::new()),
             status_note,
+            catchup_requested: AtomicBool::new(false),
             overflows: AtomicU64::new(0),
             db: Arc::clone(&ctx.db),
             quarantine: Arc::clone(&ctx.quarantine),
@@ -371,14 +610,119 @@ impl Shared {
             cache.clear();
         }
         cache.insert(key, verdict);
+        drop(cache);
+        self.cache_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Atomic write of the verdict cache so warm verdicts survive daemon
+    /// restarts (no re-check wave on the next start).
+    fn save_cache(&self) {
+        if !self.cache_dirty.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let entries: Vec<CacheFileEntry> = self
+            .cache
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, verdict)| CacheFileEntry {
+                dev: key.dev,
+                ino: key.ino,
+                mtime_secs: key.mtime_secs,
+                size: key.size,
+                infected: match verdict {
+                    Verdict::Clean => None,
+                    Verdict::Infected(signature) => Some(signature.clone()),
+                },
+            })
+            .collect();
+        let Ok(raw) = serde_json::to_string(&entries) else {
+            return;
+        };
+        let path = cache_file_path(&self.data_dir);
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, raw).is_ok() {
+            let _ = fs::rename(&tmp, &path);
+        }
+        *self.last_cache_save.lock().unwrap() = Instant::now();
+    }
+
+    /// Churn gate: enqueue at most once per cooldown; changes during the
+    /// cooldown mark the path dirty so one final scan happens afterwards
+    /// (latest-wins). Returns true when the path should be enqueued now.
+    fn churn_try_queue(&self, path: &Path) -> bool {
+        let mut churn = self.churn.lock().unwrap();
+        if churn.len() > CACHE_CAP {
+            churn.clear();
+        }
+        let now = Instant::now();
+        match churn.get_mut(path) {
+            Some(entry) if now.duration_since(entry.last_queued) < CHURN_COOLDOWN => {
+                entry.dirty = true;
+                false
+            }
+            Some(entry) => {
+                entry.last_queued = now;
+                entry.dirty = false;
+                true
+            }
+            None => {
+                churn.insert(
+                    path.to_path_buf(),
+                    ChurnEntry {
+                        last_queued: now,
+                        dirty: false,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Re-enqueue churn paths that changed during their cooldown and whose
+    /// cooldown has now elapsed (called from the housekeeping thread).
+    fn churn_flush(&self, queue: &ScanQueue) {
+        let now = Instant::now();
+        let due: Vec<PathBuf> = {
+            let mut churn = self.churn.lock().unwrap();
+            let due: Vec<PathBuf> = churn
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.dirty && now.duration_since(entry.last_queued) >= CHURN_COOLDOWN
+                })
+                .map(|(path, _)| path.clone())
+                .collect();
+            for path in &due {
+                if let Some(entry) = churn.get_mut(path) {
+                    entry.last_queued = now;
+                    entry.dirty = false;
+                }
+            }
+            due
+        };
+        for path in due {
+            queue.push_scan(path, Lane::Churn);
+        }
     }
 
     /// Exec-gate verdict (L1+L2): cache hit instant; miss = bounded engine
     /// scan; over budget, timeout, or engine error = ALLOW + re-queue.
     /// Returns true to allow execution.
-    fn exec_verdict(&self, path: &Path, queue: &ScanQueue, deadline: Instant) -> bool {
-        let Some(key) = CacheKey::from_path(path) else {
-            return true; // can't stat → fail open
+    fn exec_verdict(
+        &self,
+        path: &Path,
+        meta: Option<FileMeta>,
+        queue: &ScanQueue,
+        deadline: Instant,
+    ) -> bool {
+        let key = match meta {
+            Some(meta) => CacheKey::from_meta(&meta),
+            None => {
+                let Some(m) = stat_meta(path) else {
+                    return true; // can't stat → fail open
+                };
+                CacheKey::from_meta(&m)
+            }
         };
         if let Some(verdict) = self.cache_lookup(&key) {
             return match verdict {
@@ -394,7 +738,7 @@ impl Shared {
                 path,
                 "verdict batch budget exhausted; allowing and queueing re-scan",
             );
-            queue.push_scan(path.to_path_buf());
+            queue.push_scan(path.to_path_buf(), Lane::Exec);
             return true;
         }
         let started = Instant::now();
@@ -424,12 +768,12 @@ impl Shared {
             }
             Some(ScanOutcome::Error { message }) => {
                 self.note_error(path, &format!("verdict error: {message}; allowing"));
-                queue.push_scan(path.to_path_buf());
+                queue.push_scan(path.to_path_buf(), Lane::Exec);
                 true
             }
             None => {
                 self.note_error(path, "verdict over budget; allowing");
-                queue.push_scan(path.to_path_buf());
+                queue.push_scan(path.to_path_buf(), Lane::Exec);
                 true
             }
         }
@@ -437,6 +781,18 @@ impl Shared {
 
     /// One async scan through a worker's persistent clamd connection.
     fn scan_one(&self, path: &Path, client: &mut Option<ClamdClient>) {
+        // Pre-scan metadata: the cache key for the content about to be
+        // scanned (a rewrite mid-scan invalidates itself via a new key on
+        // the next event).
+        let Some(meta) = stat_meta(path) else {
+            return; // vanished between queueing and scanning
+        };
+        let key = CacheKey::from_meta(&meta);
+        // Verdicts already cached (e.g. catch-up sweep over scanned files)
+        // cost nothing here.
+        if self.cache_lookup(&key).is_some() {
+            return;
+        }
         if client.is_none() {
             *client = ClamdClient::connect_with_read_timeout(WORKER_READ_TIMEOUT).ok();
             if let Some(c) = client.as_ref()
@@ -451,15 +807,11 @@ impl Shared {
         };
         match c.scan_path(path) {
             Ok(ScanOutcome::Infected { signature }) => {
-                if let Some(key) = CacheKey::from_path(path) {
-                    self.cache_put(key, Verdict::Infected(signature.clone()));
-                }
+                self.cache_put(key, Verdict::Infected(signature.clone()));
                 self.handle_detection(path, &signature, "detected");
             }
             Ok(ScanOutcome::Clean) => {
-                if let Some(key) = CacheKey::from_path(path) {
-                    self.cache_put(key, Verdict::Clean);
-                }
+                self.cache_put(key, Verdict::Clean);
             }
             Ok(ScanOutcome::Error { message }) => {
                 self.note_error(path, &message);
@@ -511,14 +863,14 @@ impl Shared {
         );
     }
 
-    /// Kernel event-queue overflow: events were dropped. Visibility is
-    /// degraded until a catch-up sweep (Phase B) covers the mount; say so
-    /// loudly but rate-limited.
+    /// Kernel event-queue overflow: events were dropped. Request a
+    /// catch-up sweep and say so loudly but rate-limited.
     fn note_overflow(&self) {
         let count = self.overflows.fetch_add(1, Ordering::Relaxed) + 1;
         *self.status_note.lock().unwrap() = Some(format!(
-            "kernel event queue overflowed {count}×: visibility degraded until catch-up"
+            "kernel event queue overflowed {count}×: catch-up sweep pending"
         ));
+        self.catchup_requested.store(true, Ordering::Relaxed);
         let path = Path::new("<kernel queue>");
         let mut recent = self.recent_errors.lock().unwrap();
         let now = Instant::now();
@@ -790,7 +1142,10 @@ fn spawn_watcher(
 ) -> Result<SpawnedWatcher, String> {
     let fan_fd = fanotify::init().map_err(friendly_init_error)?;
 
-    let mask = fanotify::FAN_CLOSE_WRITE | fanotify::FAN_OPEN_EXEC_PERM;
+    let mut mask = fanotify::FAN_CLOSE_WRITE | fanotify::FAN_OPEN_EXEC_PERM;
+    if ctx.settings.realtime.scan_on_open {
+        mask |= fanotify::FAN_OPEN;
+    }
     let mut marked = Vec::new();
     match kariba_core::mounts::list_mounts() {
         Ok(all) => {
@@ -814,7 +1169,7 @@ fn spawn_watcher(
     }
 
     let fan = FanFd::new(fan_fd);
-    let shared = Arc::new(Shared::new(ctx, status_note));
+    let shared = Arc::new(Shared::new(ctx, status_note, marked.clone()));
     let queue = Arc::new(ScanQueue::new(Arc::clone(&shared.db)));
     queue.report_pending();
 
@@ -835,10 +1190,8 @@ fn spawn_watcher(
                 while let Some(task) = queue.pop(&exit, Duration::from_millis(250)) {
                     match task {
                         Task::Scan(path) => {
-                            if path.exists() {
-                                shared.scan_one(&path, &mut client);
-                                shared.progress_tick(&queue);
-                            }
+                            shared.scan_one(&path, &mut client);
+                            shared.progress_tick(&queue);
                         }
                         Task::GateDetection { path, signature } => {
                             shared.handle_detection(&path, &signature, "denied");
@@ -851,24 +1204,62 @@ fn spawn_watcher(
         }
     }
 
-    // Spill thread: batches overflow paths from the spill buffer into
-    // SQLite. Intake only ever appends to the buffer, so it stays fast.
-    let spill_queue = Arc::clone(&queue);
-    let spill_exit = Arc::clone(&exit);
-    let spill_thread = std::thread::Builder::new()
-        .name("kariba-rt-spill".into())
+    // Housekeeping thread: batches overflow paths from the spill buffer
+    // into SQLite, flushes churn re-scans whose cooldown elapsed, and
+    // persists the verdict cache periodically. Intake only ever appends
+    // to buffers, so it stays fast.
+    let hk_shared = Arc::clone(&shared);
+    let hk_queue = Arc::clone(&queue);
+    let hk_exit = Arc::clone(&exit);
+    let housekeeping_thread = std::thread::Builder::new()
+        .name("kariba-rt-housekeeping".into())
         .spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(250));
-                if spill_exit.load(Ordering::Relaxed) {
+                if hk_exit.load(Ordering::Relaxed) {
                     break;
                 }
-                let batch = spill_queue.take_spill_buf();
+                let batch = hk_queue.take_spill_buf();
                 if !batch.is_empty()
-                    && let Ok(mut db) = spill_queue.db.lock()
+                    && let Ok(mut db) = hk_queue.db.lock()
                 {
                     db.spill_pending(&batch);
                 }
+                hk_shared.churn_flush(&hk_queue);
+                let save_due = hk_shared
+                    .last_cache_save
+                    .lock()
+                    .map(|t| t.elapsed() >= CACHE_SAVE_INTERVAL)
+                    .unwrap_or(false);
+                if save_due {
+                    hk_shared.save_cache();
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+
+    // Catch-up sweep thread: after a kernel queue overflow, walk the
+    // watched mounts and feed paths into pending_scans (lowest priority),
+    // yielding whenever live traffic is pending. Gated by auto_catchup.
+    let sweep_shared = Arc::clone(&shared);
+    let sweep_queue = Arc::clone(&queue);
+    let sweep_exit = Arc::clone(&exit);
+    let sweep_thread = std::thread::Builder::new()
+        .name("kariba-rt-catchup".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if sweep_exit.load(Ordering::Relaxed) {
+                    break;
+                }
+                if !sweep_shared.auto_catchup
+                    || !sweep_shared
+                        .catchup_requested
+                        .swap(false, Ordering::Relaxed)
+                {
+                    continue;
+                }
+                sweep_shared.run_catchup(&sweep_queue, &sweep_exit);
             }
         })
         .map_err(|e| e.to_string())?;
@@ -888,7 +1279,8 @@ fn spawn_watcher(
                 run_shared,
                 run_queue,
                 workers,
-                spill_thread,
+                housekeeping_thread,
+                sweep_thread,
                 run_stop,
                 run_exit,
                 run_heartbeat,
@@ -904,6 +1296,93 @@ fn spawn_watcher(
         },
         mounts: marked,
     })
+}
+
+impl Shared {
+    /// Catch-up sweep: walk the watched mounts and spill paths into
+    /// pending_scans, which workers drain only when all live traffic is
+    //  done — recovery never competes with protection.
+    fn run_catchup(&self, queue: &ScanQueue, exit: &AtomicBool) {
+        let mounts: Vec<PathBuf> = self.mounts.clone();
+        let mount_strings: Vec<String> = mounts.iter().map(|m| m.display().to_string()).collect();
+        let mount_list = mount_strings.join(", ");
+        let scan_id = self
+            .db
+            .lock()
+            .map(|mut db| db.insert_scan("catchup", &mount_strings))
+            .unwrap_or(0);
+        eprintln!(
+            "karibad: real-time: catch-up sweep starting ({})",
+            if mounts.len() == 1 {
+                mount_list.clone()
+            } else {
+                format!("{} mounts", mounts.len())
+            }
+        );
+        let mut walked = 0u64;
+        let mut batch: Vec<PathBuf> = Vec::with_capacity(SWEEP_FLUSH_BATCH);
+        let flush = |batch: &mut Vec<PathBuf>| {
+            if batch.is_empty() {
+                return;
+            }
+            if let Ok(mut db) = self.db.lock() {
+                db.spill_pending(batch);
+            }
+            batch.clear();
+        };
+        'outer: for mount in &mounts {
+            let mut stack = vec![mount.clone()];
+            while let Some(dir) = stack.pop() {
+                if exit.load(Ordering::Relaxed) {
+                    break 'outer;
+                }
+                // Yield to live traffic before walking on.
+                while queue.depth() >= SWEEP_YIELD_AT {
+                    if exit.load(Ordering::Relaxed) {
+                        break 'outer;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                let Ok(entries) = fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if self.exclusions.is_excluded(&path) {
+                        continue;
+                    }
+                    let file_type = entry.file_type().ok();
+                    if file_type.as_ref().is_some_and(|t| t.is_dir()) {
+                        stack.push(path);
+                        continue;
+                    }
+                    if !file_type.as_ref().is_some_and(|t| t.is_file()) {
+                        continue; // symlinks, sockets, devices: skip
+                    }
+                    batch.push(path);
+                    walked += 1;
+                    if batch.len() >= SWEEP_FLUSH_BATCH {
+                        flush(&mut batch);
+                    }
+                    if walked.is_multiple_of(50_000) {
+                        eprintln!("karibad: real-time: catch-up sweep: {walked} paths queued");
+                    }
+                }
+            }
+        }
+        flush(&mut batch);
+        if let Ok(mut db) = self.db.lock() {
+            db.finish_scan(scan_id, walked, 0, "completed");
+        }
+        if exit.load(Ordering::Relaxed) {
+            eprintln!("karibad: real-time: catch-up sweep interrupted (shutdown)");
+        } else {
+            eprintln!(
+                "karibad: real-time: catch-up sweep done ({walked} paths queued for idle scanning)"
+            );
+            *self.status_note.lock().unwrap() = None;
+        }
+    }
 }
 
 fn fmt_eta(secs: u64) -> String {
@@ -939,7 +1418,8 @@ fn run(
     shared: Arc<Shared>,
     queue: Arc<ScanQueue>,
     workers: Vec<JoinHandle<()>>,
-    spill_thread: JoinHandle<()>,
+    housekeeping_thread: JoinHandle<()>,
+    sweep_thread: JoinHandle<()>,
     stop: Arc<AtomicBool>,
     exit: Arc<AtomicBool>,
     heartbeat: Arc<Mutex<Instant>>,
@@ -973,12 +1453,13 @@ fn run(
     }
 
     // L5 shutdown order: fd first (already closed if watchdog/stop did it —
-    // close is idempotent), then signal workers + spill thread to exit,
+    // close is idempotent), then signal workers + helper threads to exit,
     // then persist whatever is still queued, interrupt blocked scans, and
     // join. The remainder is rescanned by the next lifetime, never here.
     fan.close();
     exit.store(true, Ordering::Relaxed);
-    let _ = spill_thread.join();
+    let _ = housekeeping_thread.join();
+    let _ = sweep_thread.join();
     let mut paths = queue.take_spill_buf();
     paths.extend(queue.drain_paths());
     queue.persist(paths);
@@ -987,6 +1468,7 @@ fn run(
     for worker in workers {
         let _ = worker.join();
     }
+    shared.save_cache();
 
     if let Ok(mut db) = shared.db.lock() {
         db.finish_scan(
@@ -999,7 +1481,7 @@ fn run(
 }
 
 /// Resolve one event, answer permission events synchronously, queue
-/// close-write paths for the workers. The event fd is closed before
+/// close-write/open paths for the workers. The event fd is closed before
 /// returning, so kernel-held fds never accumulate.
 fn intake_event(
     shared: &Shared,
@@ -1018,6 +1500,7 @@ fn intake_event(
     }
     let is_exec_perm = event.mask & fanotify::FAN_OPEN_EXEC_PERM != 0;
     let is_close_write = event.mask & fanotify::FAN_CLOSE_WRITE != 0;
+    let is_open = event.mask & fanotify::FAN_OPEN != 0;
     let path = fs::read_link(format!("/proc/self/fd/{}", event.fd)).ok();
 
     // The kernel suffixes readlink targets of already-unlinked files;
@@ -1028,8 +1511,14 @@ fn intake_event(
 
     if is_exec_perm {
         let allow = match &path {
-            Some(path) if !vanished && !shared.exclusions.is_excluded(path) => {
-                shared.exec_verdict(path, queue, deadline)
+            // Gate exclusions (default /usr, /boot) pass without a verdict;
+            // full exclusions pass too. Async scanning still covers both.
+            Some(path)
+                if !vanished
+                    && !shared.exclusions.is_excluded(path)
+                    && !shared.exclusions.is_gate_excluded(path) =>
+            {
+                shared.exec_verdict(path, fstat_meta(event.fd), queue, deadline)
             }
             _ => true,
         };
@@ -1042,8 +1531,154 @@ fn intake_event(
         && !shared.exclusions.is_excluded(path)
         && !writer_is_engine(event.pid)
     {
-        queue.push_scan(path.clone());
+        let meta = fstat_meta(event.fd);
+        let mode = meta.map(|m| m.mode).unwrap_or(0);
+        match classify(path, mode) {
+            // Churn gate: live databases get at most one scan per cooldown,
+            // plus one final scan of the settled content.
+            Lane::Churn => {
+                if shared.churn_try_queue(path) {
+                    queue.push_scan(path.clone(), Lane::Churn);
+                }
+            }
+            lane => queue.push_scan(path.clone(), lane),
+        }
+    } else if is_open
+        && shared.scan_on_open
+        && !vanished
+        && let Some(path) = &path
+        && !shared.exclusions.is_excluded(path)
+        && !writer_is_engine(event.pid)
+        && let Some(meta) = fstat_meta(event.fd)
+        && !meta.is_dir
+    {
+        // Cache-first read check: clean-and-unchanged files cost a hashmap
+        // lookup and nothing else; misses queue an async scan. Infected
+        // hits are left alone here (soft boundary; re-quarantining a
+        // deliberately restored file on read would fight the user).
+        let key = CacheKey::from_meta(&meta);
+        if shared.cache_lookup(&key).is_none() {
+            let lane = classify(path, meta.mode);
+            if lane != Lane::Churn || shared.churn_try_queue(path) {
+                queue.push_scan(path.clone(), lane);
+            }
+        }
     }
 
     fanotify::close_fd(event.fd);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classification_lanes() {
+        // Exec bit wins.
+        assert_eq!(classify(Path::new("/tmp/tool"), 0o755), Lane::Exec);
+        // Shared libraries and AppImages without an exec bit.
+        assert_eq!(classify(Path::new("/usr/lib/libfoo.so"), 0o644), Lane::Exec);
+        assert_eq!(
+            classify(Path::new("/opt/game/libbar.so.1"), 0o644),
+            Lane::Exec
+        );
+        assert_eq!(
+            classify(Path::new("/opt/Kariba.AppImage"), 0o644),
+            Lane::Exec
+        );
+        // Bin-like directories.
+        assert_eq!(
+            classify(Path::new("/opt/app/bin/runner"), 0o644),
+            Lane::Exec
+        );
+        // Churn: live databases and logs, checked before everything else.
+        assert_eq!(classify(Path::new("/home/me/app.db"), 0o644), Lane::Churn);
+        assert_eq!(
+            classify(Path::new("/home/me/app.db-wal"), 0o644),
+            Lane::Churn
+        );
+        assert_eq!(
+            classify(Path::new("/home/me/data.sqlite"), 0o644),
+            Lane::Churn
+        );
+        assert_eq!(classify(Path::new("/var/log/foo.log"), 0o644), Lane::Churn);
+        // Media.
+        assert_eq!(classify(Path::new("/tmp/texture.PNG"), 0o644), Lane::Media);
+        assert_eq!(classify(Path::new("/tmp/song.mp3"), 0o644), Lane::Media);
+        // Everything else is data.
+        assert_eq!(classify(Path::new("/tmp/notes.txt"), 0o644), Lane::Data);
+        assert_eq!(classify(Path::new("/tmp/archive.zip"), 0o644), Lane::Data);
+    }
+
+    #[test]
+    fn queue_drains_in_priority_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        let queue = ScanQueue::new(Arc::new(Mutex::new(db)));
+        let exit = Arc::new(AtomicBool::new(false));
+
+        queue.push_scan(PathBuf::from("/m/1.png"), Lane::Media);
+        queue.push_scan(PathBuf::from("/d/1.txt"), Lane::Data);
+        queue.push_scan(PathBuf::from("/e/1.bin"), Lane::Exec);
+        queue.push_scan(PathBuf::from("/c/1.db"), Lane::Churn);
+        queue.push_gate_detection(PathBuf::from("/g/1.bin"), "Sig".into());
+
+        let mut order = Vec::new();
+        for _ in 0..5 {
+            let Some(task) = queue.pop(&exit, Duration::from_millis(10)) else {
+                break;
+            };
+            match task {
+                Task::GateDetection { path, .. } => order.push(path),
+                Task::Scan(path) => order.push(path),
+            }
+        }
+        assert_eq!(
+            order,
+            vec![
+                PathBuf::from("/g/1.bin"), // gate bookkeeping first
+                PathBuf::from("/e/1.bin"), // exec lane
+                PathBuf::from("/d/1.txt"), // data lane
+                PathBuf::from("/c/1.db"),  // churn rides with data, FIFO
+                PathBuf::from("/m/1.png"), // media last
+            ]
+        );
+    }
+
+    #[test]
+    fn queue_dedups_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        let queue = ScanQueue::new(Arc::new(Mutex::new(db)));
+        let exit = Arc::new(AtomicBool::new(false));
+
+        queue.push_scan(PathBuf::from("/a/file"), Lane::Data);
+        queue.push_scan(PathBuf::from("/a/file"), Lane::Data);
+        queue.push_scan(PathBuf::from("/a/file"), Lane::Exec);
+
+        assert!(queue.pop(&exit, Duration::from_millis(10)).is_some());
+        // Nothing else was queued: depth is back to zero.
+        assert_eq!(queue.depth(), 0);
+    }
+
+    #[test]
+    fn churn_gate_blocks_rapid_requeue() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("test.db")).unwrap();
+        let shared_db = Arc::new(Mutex::new(db));
+        let status_note = Arc::new(Mutex::new(None));
+        let ctx = WatcherCtx {
+            db: Arc::clone(&shared_db),
+            quarantine: Arc::new(Quarantine::new(dir.path().join("q")).unwrap()),
+            broadcaster: Arc::new(Broadcaster::new()),
+            data_dir: dir.path().to_path_buf(),
+            settings: kariba_core::config::Settings::default(),
+        };
+        let shared = Shared::new(&ctx, status_note, Vec::new());
+
+        let path = Path::new("/home/me/app.db");
+        assert!(shared.churn_try_queue(path)); // first write: scan now
+        assert!(!shared.churn_try_queue(path)); // immediate rewrite: cooldown
+        assert!(!shared.churn_try_queue(path)); // still cooling down
+    }
 }

@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 // User-configurable scan exclusions, snapshotted from Settings when a scan
 // starts or the watcher boots. Path entries act as prefixes; extension
 // entries are `*.ext` patterns matched case-insensitively against the file
-// extension.
+// extension. Gate prefixes exclude paths from the exec gate ONLY (async
+// scanning still covers them).
 pub struct Exclusions {
     prefixes: Vec<PathBuf>,
     extensions: Vec<String>,
+    gate_prefixes: Vec<PathBuf>,
 }
 
 impl Exclusions {
@@ -27,6 +29,13 @@ impl Exclusions {
                 .iter()
                 .filter_map(|e| e.trim().strip_prefix("*."))
                 .map(str::to_lowercase)
+                .collect(),
+            gate_prefixes: settings
+                .exclusions
+                .gate_paths
+                .iter()
+                .map(|p| paths::expand_tilde(Path::new(p.trim())))
+                .filter(|p| !p.as_os_str().is_empty())
                 .collect(),
         }
     }
@@ -49,6 +58,14 @@ impl Exclusions {
         path.extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| self.extensions.contains(&ext.to_lowercase()))
+    }
+
+    /// Gate-only exclusion: boot/system paths whose execs never wait on a
+    /// verdict. Async scanning is unaffected.
+    pub fn is_gate_excluded(&self, path: &Path) -> bool {
+        self.gate_prefixes
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
     }
 }
 

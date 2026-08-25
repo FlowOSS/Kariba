@@ -9,6 +9,13 @@ use std::path::Path;
 /// that the user may delete (and restore).
 pub const BUILTIN_EXCLUSION_PATHS: [&str; 4] = ["/proc", "/sys", "/dev", "/run"];
 
+/// Paths excluded from the exec GATE only (async scanning still covers
+/// them). Keeps boot, system services, and package transactions from ever
+/// waiting on karibad; messing with these paths already requires root, and
+/// their integrity is AIDE's job (Phase 2). User-removable, same model as
+/// the built-in exclusions.
+pub const BUILTIN_GATE_PATHS: [&str; 2] = ["/usr", "/boot"];
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -22,6 +29,11 @@ pub struct Settings {
 pub struct RealtimeSettings {
     pub enabled: bool,
     pub auto_quarantine: bool,
+    // Cache-first read checks on file open (FAN_OPEN). Phase B.
+    pub scan_on_open: bool,
+    // Automatic catch-up sweep of a mount after visibility loss
+    // (kernel queue overflow). Phase B.
+    pub auto_catchup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +47,9 @@ pub struct ScanSettings {
 pub struct ExclusionSettings {
     pub paths: Vec<String>,
     pub extensions: Vec<String>,
+    // Exec-gate-only exclusions: these paths are allowed through the
+    // gate without a verdict scan (async scanning still covers them).
+    pub gate_paths: Vec<String>,
 }
 
 impl Default for RealtimeSettings {
@@ -42,6 +57,8 @@ impl Default for RealtimeSettings {
         Self {
             enabled: true,
             auto_quarantine: true,
+            scan_on_open: true,
+            auto_catchup: true,
         }
     }
 }
@@ -62,6 +79,10 @@ impl Default for ExclusionSettings {
                 .map(|s| (*s).to_string())
                 .collect(),
             extensions: Vec::new(),
+            gate_paths: BUILTIN_GATE_PATHS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         }
     }
 }
@@ -135,6 +156,28 @@ impl Settings {
         }
         true
     }
+
+    /// Built-in exec-gate paths currently missing from the config.
+    pub fn missing_gate_builtins(&self) -> Vec<&'static str> {
+        BUILTIN_GATE_PATHS
+            .iter()
+            .copied()
+            .filter(|builtin| !self.exclusions.gate_paths.iter().any(|p| p == builtin))
+            .collect()
+    }
+
+    /// Re-adds missing built-in exec-gate paths. Reports whether anything
+    /// changed.
+    pub fn restore_gate_builtins(&mut self) -> bool {
+        let missing = self.missing_gate_builtins();
+        if missing.is_empty() {
+            return false;
+        }
+        for builtin in missing {
+            self.exclusions.gate_paths.push(builtin.to_string());
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -146,9 +189,12 @@ mod tests {
         let s = Settings::default();
         assert!(s.realtime.enabled);
         assert!(s.realtime.auto_quarantine);
+        assert!(s.realtime.scan_on_open);
+        assert!(s.realtime.auto_catchup);
         assert!(s.scan.default_quarantine);
         assert_eq!(s.exclusions.paths, BUILTIN_EXCLUSION_PATHS);
         assert!(s.exclusions.extensions.is_empty());
+        assert_eq!(s.exclusions.gate_paths, BUILTIN_GATE_PATHS);
     }
 
     #[test]
@@ -167,6 +213,7 @@ mod tests {
         assert!(s.realtime.auto_quarantine);
         assert!(s.scan.default_quarantine);
         assert_eq!(s.exclusions.paths, BUILTIN_EXCLUSION_PATHS);
+        assert_eq!(s.exclusions.gate_paths, BUILTIN_GATE_PATHS);
     }
 
     #[test]
@@ -201,5 +248,15 @@ mod tests {
         assert!(s.exclusions.paths.contains(&"/dev".to_string()));
         assert!(s.exclusions.paths.contains(&"/home/me/vms".to_string()));
         assert!(!s.restore_builtins());
+    }
+
+    #[test]
+    fn restore_gate_builtins_only_adds_missing() {
+        let mut s = Settings::default();
+        s.exclusions.gate_paths.retain(|p| p != "/boot");
+        assert_eq!(s.missing_gate_builtins(), vec!["/boot"]);
+        assert!(s.restore_gate_builtins());
+        assert!(s.exclusions.gate_paths.contains(&"/boot".to_string()));
+        assert!(!s.restore_gate_builtins());
     }
 }

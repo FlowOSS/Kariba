@@ -43,6 +43,8 @@ export interface RealtimeDetection {
 export interface RealtimeSettings {
   enabled: boolean;
   auto_quarantine: boolean;
+  scan_on_open: boolean;
+  auto_catchup: boolean;
 }
 
 export interface ScanSettings {
